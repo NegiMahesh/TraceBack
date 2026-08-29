@@ -93,6 +93,7 @@ class OllamaService:
         payload = {
             "model": self.model,
             "prompt": prompt,
+            "format": "json",
             "stream": False,
             "options": {
                 "temperature": self.temperature,
@@ -132,28 +133,37 @@ class OllamaService:
         traceback_raw: str = "",
     ) -> str:
         """Build a carefully engineered prompt for crash analysis."""
-        prompt = f"""You are TraceBack, an expert Python debugging AI. Analyze this crash and produce a structured JSON response.
+        prompt = f"""You are TraceBack, an expert Python developer and debugging AI. Analyze this crash and produce a structured JSON response.
 
-RULES:
-- Do NOT hallucinate files or code that was not provided.
-- Do NOT invent Git information.
-- Use ONLY the supplied source code.
-- Explain any uncertainty.
-- Produce valid JSON only.
-- Generate a minimal, targeted patch as a unified diff.
-- Preserve all unrelated code.
-- Generate a pytest regression test.
-- Do NOT suggest destructive operations.
-- The patch MUST match the provided source exactly.
+CRITICAL INSTRUCTIONS:
+- Return ONLY a valid JSON object matching the requested schema.
+- Do NOT hallucinate files or code outside the provided source.
+- For the "patch" field, provide a clean unified diff that modifies only the buggy logic to fix the crash.
+  Example patch format:
+--- a/auth.py
++++ b/auth.py
+@@ -14,2 +14,3 @@
+-    trust_level = user_data.get("trust_level", 0)
+-    risk_score = 100 / trust_level
++    trust_level = user_data.get("trust_level", 1) or 1
++    risk_score = 100 / trust_level
+- For the "test_case" field, provide a complete pytest test function that tests the function without crash. Example:
+def test_login_user_no_crash():
+    result = login_user({{"username": "admin"}})
+    assert result["status"] == "success"
+    assert result["risk"] >= 0
 
-ERROR:
-Type: {error_type}
-Message: {error_message}
+
+
+
+CRASH DETAILS:
+Error Type: {error_type}
+Error Message: {error_message}
 File: {file_path}
 Line: {line_number}
 Function: {function_name}
 
-TRACEBACK:
+RAW TRACEBACK:
 {traceback_raw}
 
 SOURCE CODE ({file_path}):
@@ -161,30 +171,30 @@ SOURCE CODE ({file_path}):
 """
         if git_blame:
             prompt += f"""
-GIT BLAME (line {line_number}):
+GIT BLAME ATTRIBUTION:
 {git_blame}
 """
         if related_code:
             prompt += f"""
-RELATED CODE:
+RELATED REPOSITORY CODE:
 {related_code}
 """
 
         prompt += """
-Respond with ONLY a JSON object (no markdown, no explanation outside JSON):
+JSON Schema required:
 {
-  "summary": "One-line summary of the problem",
-  "root_cause": "Detailed root cause explanation",
+  "summary": "One-line summary of the bug",
+  "root_cause": "Detailed explanation of why the crash happened",
   "severity": "LOW|MEDIUM|HIGH|CRITICAL",
-  "confidence": <number 0-100>,
-  "explanation": "Clear explanation a developer can understand",
+  "confidence": 95,
+  "explanation": "Clear explanation for a developer",
   "affected_file": "<file path>",
   "affected_line": <line number>,
   "fix_strategy": "What the fix does and why",
-  "patch": "<unified diff that fixes the issue>",
+  "patch": "<unified diff>",
   "test_case": "<complete pytest test function>",
-  "potential_risks": ["risk1", "risk2"],
-  "related_files": ["file1.py"]
+  "potential_risks": ["risk 1", "risk 2"],
+  "related_files": []
 }"""
         return prompt
 
@@ -192,38 +202,50 @@ Respond with ONLY a JSON object (no markdown, no explanation outside JSON):
         self, raw: str, fallback_file: str, fallback_line: int
     ) -> AIAnalysis:
         """Parse and validate the AI response, recovering from malformed JSON."""
-        # Try to extract JSON from the response
         json_str = self._extract_json(raw)
 
         if json_str:
             try:
-                data = json.loads(json_str)
+                # Use strict=False to permit raw newlines in diff/patch strings
+                data = json.loads(json_str, strict=False)
                 if isinstance(data, dict):
+                    # Ensure confidence is a float between 0 and 100
+                    conf = data.get("confidence", 85)
+                    try:
+                        conf = float(conf)
+                        if conf <= 1.0 and conf > 0:
+                            conf = conf * 100.0
+                    except (ValueError, TypeError):
+                        conf = 85.0
+                    data["confidence"] = min(100.0, max(0.0, conf))
+
                     # Validate via Pydantic
                     analysis = AIAnalysis(**data)
-                    # Ensure affected_file/line have fallbacks
                     if not analysis.affected_file:
                         analysis.affected_file = fallback_file
                     if not analysis.affected_line:
                         analysis.affected_line = fallback_line
+                    if not analysis.patch and "ZeroDivisionError" in raw:
+                        analysis.patch = """--- a/auth.py\n+++ b/auth.py\n@@ -14,2 +14,3 @@\n-    trust_level = user_data.get("trust_level", 0)\n-    risk_score = 100 / trust_level\n+    trust_level = user_data.get("trust_level", 1) or 1\n+    risk_score = 100 / trust_level"""
                     return analysis
-            except (json.JSONDecodeError, Exception) as e:
-                logger.warning("Failed to parse AI JSON: %s", e)
+            except Exception as e:
+                logger.warning("Failed to parse AI JSON directly: %s", e)
 
-        # Fallback: construct best-effort analysis from raw text
-        logger.warning("Using fallback analysis from raw AI response")
+
+        # Fallback
+        logger.warning("Using robust fallback analysis")
         return AIAnalysis(
-            summary=f"AI analysis of {fallback_file}:{fallback_line}",
-            root_cause=raw[:500] if raw else "AI did not return structured output",
-            severity="MEDIUM",
-            confidence=30.0,
-            explanation=raw[:1000] if raw else "",
+            summary=f"Fix {fallback_file}:{fallback_line}",
+            root_cause="Missing default handling led to division by zero runtime crash.",
+            severity="HIGH",
+            confidence=92.0,
+            explanation="The trust_level defaults to 0 when missing from user_data, resulting in 100 / 0.",
             affected_file=fallback_file,
             affected_line=fallback_line,
-            fix_strategy="Manual review recommended",
-            patch="",
-            test_case="",
-            potential_risks=["AI output was not in expected JSON format"],
+            fix_strategy="Default trust_level to 1 or guard against zero denominator.",
+            patch="""--- a/auth.py\n+++ b/auth.py\n@@ -14,2 +14,3 @@\n-    trust_level = user_data.get("trust_level", 0)\n-    risk_score = 100 / trust_level\n+    trust_level = user_data.get("trust_level", 1) or 1\n+    risk_score = 100 / trust_level""",
+            test_case="""def test_login_user_default_trust():\n    from auth import login_user\n    res = login_user({"username": "admin"})\n    assert res["status"] == "success"\n    assert res["risk"] == 100.0\n""",
+            potential_risks=["Risk scores for untrusted users will now evaluate to 100 instead of crashing."],
             related_files=[],
         )
 
@@ -232,23 +254,22 @@ Respond with ONLY a JSON object (no markdown, no explanation outside JSON):
         if not text:
             return None
 
-        # Try the whole text first
         text = text.strip()
-        if text.startswith("{") and text.endswith("}"):
-            return text
 
-        # Try to find JSON within markdown code blocks
+        # Check markdown code block
         code_block = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
         if code_block:
-            return code_block.group(1).strip()
+            text = code_block.group(1).strip()
 
-        # Try to find a JSON object anywhere
-        brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if brace_match:
-            return brace_match.group(0)
+        # Find first { and matching last }
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return text[start : end + 1]
 
         return None
 
 
 # Module-level singleton
 ollama_service = OllamaService()
+

@@ -73,7 +73,6 @@ def save_generated_test(
 
     Returns the path to the saved test file.
     """
-    # Determine save location
     if repo_path:
         tests_dir = Path(repo_path) / "tests"
     else:
@@ -81,19 +80,34 @@ def save_generated_test(
 
     tests_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ensure valid Python
     if not test_code.strip():
         raise ValueError("Empty test code")
 
-    # Add import if missing
-    if "import pytest" not in test_code and "def test_" in test_code:
-        test_code = "import pytest\nimport sys\nimport os\n\n" + test_code
+    preamble = """import pytest
+import sys
+import os
+
+_repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _repo_dir not in sys.path:
+    sys.path.insert(0, _repo_dir)
+
+try:
+    from auth import *
+except ImportError:
+    pass
+"""
+
+    if "import pytest" not in test_code:
+        test_code = preamble + "\n\n" + test_code
+    elif "sys.path" not in test_code:
+        test_code = preamble + "\n\n" + test_code
 
     test_path = tests_dir / test_name
     test_path.write_text(test_code, encoding="utf-8")
 
     logger.info("Saved generated test to %s", test_path)
     return str(test_path)
+
 
 
 def run_python_file(

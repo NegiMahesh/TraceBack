@@ -237,21 +237,29 @@ def _apply_patch_to_content(
     result_lines = list(original_lines)
 
     if remove_lines:
-        # Find the first occurrence of the removed block
         start_idx = _find_block(result_lines, remove_lines)
         if start_idx is None:
             return None
 
-        # Replace the block
+        # Detect original indentation from the matched line
+        orig_line = result_lines[start_idx]
+        indent = orig_line[: len(orig_line) - len(orig_line.lstrip())]
+
+        formatted_adds = []
+        for l in add_lines:
+            line_str = l.rstrip("\r\n")
+            if line_str.strip() and not line_str.startswith(" ") and not line_str.startswith("\t"):
+                line_str = indent + line_str
+            formatted_adds.append(line_str + "\n")
+
         end_idx = start_idx + len(remove_lines)
-        new_add = [l + "\n" if not l.endswith("\n") else l for l in add_lines]
-        result_lines[start_idx:end_idx] = new_add
+        result_lines[start_idx:end_idx] = formatted_adds
     else:
-        # Pure addition — append at end
         new_add = [l + "\n" if not l.endswith("\n") else l for l in add_lines]
         result_lines.extend(new_add)
 
     return "".join(result_lines)
+
 
 
 def _find_block(lines: list[str], block: list[str]) -> int | None:

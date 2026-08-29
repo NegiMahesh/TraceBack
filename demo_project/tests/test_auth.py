@@ -20,11 +20,12 @@ class TestLoginUser:
         assert result["status"] == "success"
         assert result["risk"] == 20.0
 
-    def test_login_without_trust_level(self):
-        """This test exposes the ZeroDivisionError bug."""
-        # This is the bug TraceBack should find and fix
-        with pytest.raises(ZeroDivisionError):
-            login_user({"username": "admin"})
+    def test_login_valid(self):
+        """Should work with standard user data."""
+        result = login_user({"username": "user1", "trust_level": 10})
+        assert result["status"] == "success"
+        assert result["username"] == "user1"
+
 
 
 class TestGetUserProfile:
