@@ -32,9 +32,20 @@ class CrashRunRequest(BaseModel):
     """Request to run a Python file and capture its crash."""
 
     file_path: str = Field(..., description="Path to Python file to run")
-    args: list[str] = Field(default_factory=list, description="Arguments to pass")
-    cwd: Optional[str] = Field(None, description="Working directory")
-    timeout: int = Field(30, description="Max seconds to wait")
+    args: list[str] = Field(
+        default_factory=list,
+        description="Arguments to pass",
+    )
+    cwd: Optional[str] = Field(
+        None,
+        description="Working directory",
+    )
+    timeout: int = Field(
+        30,
+        ge=1,
+        le=300,
+        description="Maximum seconds to wait",
+    )
 
 
 class CrashRunResult(BaseModel):
@@ -52,5 +63,12 @@ class CrashRunResult(BaseModel):
 class CrashAnalyzeRequest(BaseModel):
     """Request to analyze a pasted traceback or log."""
 
-    traceback_text: str = Field("", description="Pasted traceback text")
-    repo_path: Optional[str] = Field(None, description="Repository path for source lookup")
+    traceback_text: str = Field(
+        "",
+        description="Pasted traceback text",
+    )
+
+    repo_path: Optional[str] = Field(
+        None,
+        description="Repository path for source lookup",
+    )

@@ -1,14 +1,35 @@
-"""Patch service — validation, application, rollback with safety checks."""
+"""
+TraceBack Patch Service.
+
+The service follows this rule:
+
+    ORIGINAL SOURCE
+          ↓
+    PATCH PREVIEW
+          ↓
+    MODIFIED SOURCE
+          ↓
+    APPROVAL
+          ↓
+    WRITE EXACT MODIFIED SOURCE
+
+The final file written to disk is therefore the exact file that the
+user saw in the Before / After diff.
+
+The service also supports automatic backup and rollback.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import shutil
+import re
 import time
 import uuid
 from pathlib import Path
 
 from backend.config import BACKUPS_DIR
+
 from backend.models.patch import (
     PatchApplyResult,
     PatchRecord,
@@ -16,269 +37,1109 @@ from backend.models.patch import (
     PatchValidation,
     RollbackResult,
 )
+
 from backend.services import git_service
 
-logger = logging.getLogger("traceback.patch")
 
-# In-memory patch history (in production would use a DB)
+logger = logging.getLogger(
+    "traceback.patch"
+)
+
+
 _patch_history: list[PatchRecord] = []
-_file_backups: dict[str, str] = {}  # backup_ref -> original content
+
+_file_backups: dict[str, str] = {}
 
 
-def validate_patch(
-    patch: str, target_file: str, repo_path: str
-) -> PatchValidation:
-    """Validate a patch before application."""
-    result = PatchValidation(target_file=target_file)
+# ============================================================================
+# PATH HELPERS
+# ============================================================================
+
+def resolve_repository(
+    repo_path: str,
+) -> Path:
+    """Resolve repository path."""
+
+    if not repo_path:
+        raise ValueError(
+            "Repository path is required."
+        )
+
+    repo = (
+        Path(repo_path)
+        .expanduser()
+        .resolve()
+    )
+
+    if not repo.exists():
+        raise ValueError(
+            f"Repository does not exist: {repo}"
+        )
+
+    if not repo.is_dir():
+        raise ValueError(
+            f"Repository is not a directory: {repo}"
+        )
+
+    return repo
+
+
+def resolve_target_file(
+    repo_path: str,
+    target_file: str,
+) -> Path:
+    """Resolve target file and prevent path traversal."""
+
+    if not target_file:
+        raise ValueError(
+            "Target file is required."
+        )
+
+    repo = resolve_repository(
+        repo_path
+    )
+
+    candidate = (
+        Path(target_file)
+        .expanduser()
+    )
+
+    if not candidate.is_absolute():
+        candidate = (
+            repo / candidate
+        )
+
+    target = candidate.resolve()
+
+    try:
+        target.relative_to(
+            repo
+        )
+
+    except ValueError as exc:
+        raise ValueError(
+            f"Target file is outside repository: "
+            f"{target_file}"
+        ) from exc
+
+    return target
+
+
+def relative_target_file(
+    repo_path: str,
+    target_file: str,
+) -> str:
+    """Return repository-relative POSIX path."""
+
+    repo = resolve_repository(
+        repo_path
+    )
+
+    target = resolve_target_file(
+        repo_path,
+        target_file,
+    )
+
+    return (
+        target
+        .relative_to(repo)
+        .as_posix()
+    )
+
+
+# ============================================================================
+# HASHING
+# ============================================================================
+
+def sha256_text(
+    text: str,
+) -> str:
+    """Calculate SHA-256 for source text."""
+
+    return hashlib.sha256(
+        text.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def file_sha256(
+    target: Path,
+) -> str:
+    """Calculate SHA-256 for a file."""
+
+    return sha256_text(
+        target.read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+# ============================================================================
+# PATCH PREVIEW
+# ============================================================================
+
+def preview_patch(
+    patch: str,
+    target_file: str,
+    repo_path: str,
+) -> str:
+    """
+    Generate the exact modified source without changing the file.
+    """
 
     if not patch or not patch.strip():
-        result.reason = "Patch is empty"
+        raise ValueError(
+            "Patch is empty."
+        )
+
+    target = resolve_target_file(
+        repo_path,
+        target_file,
+    )
+
+    if not target.is_file():
+        raise FileNotFoundError(
+            f"Target file does not exist: {target}"
+        )
+
+    original = target.read_text(
+        encoding="utf-8"
+    )
+
+    normalized_patch = (
+        normalize_patch(
+            patch=patch,
+            repo_path=repo_path,
+            target_file=target_file,
+        )
+    )
+
+    modified = apply_unified_diff(
+        original=original,
+        patch=normalized_patch,
+    )
+
+    if modified is None:
+        raise ValueError(
+            "The patch does not match the current source."
+        )
+
+    if modified == original:
+        raise ValueError(
+            "The patch produces no actual source change."
+        )
+
+    return modified
+
+
+# ============================================================================
+# PATCH NORMALIZATION
+# ============================================================================
+
+def normalize_patch(
+    patch: str,
+    repo_path: str,
+    target_file: str,
+) -> str:
+    """Normalize AI-generated patch headers."""
+
+    if not patch:
+        return ""
+
+    relative_path = relative_target_file(
+        repo_path,
+        target_file,
+    )
+
+    text = (
+        patch
+        .replace(
+            "\r\n",
+            "\n",
+        )
+        .replace(
+            "\r",
+            "\n",
+        )
+        .strip()
+    )
+
+    # Remove markdown fences.
+    text = re.sub(
+        r"^```(?:diff|patch)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    lines = text.splitlines()
+
+    # Locate actual diff.
+    hunk_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("@@ ")
+        ),
+        None,
+    )
+
+    old_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("--- ")
+        ),
+        None,
+    )
+
+    new_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("+++ ")
+        ),
+        None,
+    )
+
+    # No hunk at all.
+    if hunk_index is None:
+        return text
+
+    # Build proper headers.
+    if (
+        old_index is None
+        or new_index is None
+    ):
+
+        body = lines[
+            hunk_index:
+        ]
+
+        lines = [
+            f"--- a/{relative_path}",
+            f"+++ b/{relative_path}",
+            *body,
+        ]
+
+    else:
+
+        lines[old_index] = (
+            f"--- a/{relative_path}"
+        )
+
+        lines[new_index] = (
+            f"+++ b/{relative_path}"
+        )
+
+    return (
+        "\n".join(lines).strip()
+        + "\n"
+    )
+
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+def validate_patch(
+    patch: str,
+    target_file: str,
+    repo_path: str,
+) -> PatchValidation:
+    """Validate patch against current source."""
+
+    result = PatchValidation(
+        target_file=target_file
+    )
+
+    try:
+
+        repo = resolve_repository(
+            repo_path
+        )
+
+        target = resolve_target_file(
+            repo_path,
+            target_file,
+        )
+
+    except ValueError as exc:
+
+        result.reason = str(exc)
         return result
 
-    # Check target file exists
-    target = Path(repo_path) / target_file if not Path(target_file).is_absolute() else Path(target_file)
     if not target.is_file():
-        result.reason = f"Target file does not exist: {target_file}"
+
+        result.reason = (
+            f"Target file does not exist: "
+            f"{target_file}"
+        )
+
         return result
+
     result.target_exists = True
 
-    # Check for uncommitted changes
-    result.has_uncommitted_changes = git_service.has_uncommitted_changes(repo_path)
+    try:
 
-    # Validate patch format — basic checks
-    if not _is_valid_patch_format(patch):
-        result.reason = "Patch does not appear to be a valid unified diff or code change"
-        return result
+        result.has_uncommitted_changes = (
+            git_service.has_uncommitted_changes(
+                str(repo)
+            )
+        )
 
-    # Check context matches (if it's a unified diff)
-    result.context_matches = _check_context_matches(patch, target)
+    except Exception:
 
-    if not result.context_matches:
-        result.reason = "Patch context does not match current source"
-        return result
+        result.has_uncommitted_changes = (
+            False
+        )
 
-    result.valid = True
-    result.reason = "Patch validated successfully"
+    try:
+
+        original = target.read_text(
+            encoding="utf-8"
+        )
+
+        modified = preview_patch(
+            patch=patch,
+            target_file=target_file,
+            repo_path=str(repo),
+        )
+
+        if modified == original:
+
+            result.reason = (
+                "Patch produces no source change."
+            )
+
+            return result
+
+        result.context_matches = True
+        result.valid = True
+        result.reason = (
+            "Patch validated successfully."
+        )
+
+    except Exception as exc:
+
+        result.context_matches = False
+        result.valid = False
+        result.reason = str(exc)
+
     return result
 
+
+# ============================================================================
+# APPLY
+# ============================================================================
 
 def apply_patch(
     patch: str,
     target_file: str,
     repo_path: str,
     investigation_id: str = "",
+    expected_original_sha256: str = "",
+    expected_modified_code: str = "",
 ) -> PatchApplyResult:
-    """Apply a patch with backup and safety checks."""
+    """
+    Apply a patch.
+
+    If expected_modified_code is supplied, it becomes the authoritative
+    source that gets written.
+
+    If expected_original_sha256 is supplied, approval is refused when the
+    file has changed since analysis.
+    """
+
     result = PatchApplyResult()
 
-    # Resolve target path
-    target = Path(repo_path) / target_file if not Path(target_file).is_absolute() else Path(target_file)
+    try:
+
+        repo = resolve_repository(
+            repo_path
+        )
+
+        target = resolve_target_file(
+            repo_path,
+            target_file,
+        )
+
+    except ValueError as exc:
+
+        result.message = str(exc)
+        return result
+
     if not target.is_file():
-        result.message = f"Target file not found: {target_file}"
+
+        result.message = (
+            f"Target file not found: "
+            f"{target_file}"
+        )
+
         return result
 
-    # Create backup
-    backup_ref = f"backup-{uuid.uuid4().hex[:8]}"
-    try:
-        original_content = target.read_text(encoding="utf-8")
-        _file_backups[backup_ref] = original_content
+    # -----------------------------------------------------------------------
+    # Read current source.
+    # -----------------------------------------------------------------------
 
-        # Also save to disk
-        backup_dir = Path(BACKUPS_DIR)
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        backup_file = backup_dir / f"{backup_ref}_{target.name}"
-        backup_file.write_text(original_content, encoding="utf-8")
-        result.backup_ref = backup_ref
-    except Exception as e:
-        result.message = f"Failed to create backup: {e}"
+    try:
+
+        current_source = (
+            target.read_text(
+                encoding="utf-8"
+            )
+        )
+
+    except Exception as exc:
+
+        result.message = (
+            f"Could not read target file: "
+            f"{exc}"
+        )
+
         return result
 
-    # Try to apply the patch
-    try:
-        new_content = _apply_patch_to_content(original_content, patch, target_file)
-        if new_content is None:
-            result.message = "Failed to apply patch — could not match context"
-            return result
+    current_hash = (
+        sha256_text(
+            current_source
+        )
+    )
 
-        # Write the patched file
-        target.write_text(new_content, encoding="utf-8")
+    # -----------------------------------------------------------------------
+    # Detect source changing after analysis.
+    # -----------------------------------------------------------------------
+
+    if (
+        expected_original_sha256
+        and
+        current_hash
+        != expected_original_sha256
+    ):
+
+        result.message = (
+            "Patch rejected because the source file "
+            "changed after analysis. Please run a new analysis."
+        )
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # Determine exact modified source.
+    # -----------------------------------------------------------------------
+
+    try:
+
+        if expected_modified_code:
+
+            modified_source = (
+                expected_modified_code
+            )
+
+        else:
+
+            normalized_patch = (
+                normalize_patch(
+                    patch=patch,
+                    repo_path=str(repo),
+                    target_file=target_file,
+                )
+            )
+
+            modified_source = (
+                apply_unified_diff(
+                    original=current_source,
+                    patch=normalized_patch,
+                )
+            )
+
+            if modified_source is None:
+                result.message = (
+                    "Patch does not match the current source."
+                )
+                return result
+
+    except Exception as exc:
+
+        result.message = (
+            f"Could not prepare modified source: "
+            f"{exc}"
+        )
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # Validate actual change.
+    # -----------------------------------------------------------------------
+
+    if modified_source == current_source:
+
+        result.message = (
+            "Patch produces no actual source change."
+        )
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # Backup.
+    # -----------------------------------------------------------------------
+
+    backup_ref = (
+        f"backup-{uuid.uuid4().hex[:8]}"
+    )
+
+    try:
+
+        backup_dir = (
+            Path(BACKUPS_DIR)
+            .resolve()
+        )
+
+        backup_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        backup_file = (
+            backup_dir
+            / f"{backup_ref}_{target.name}"
+        )
+
+        backup_file.write_text(
+            current_source,
+            encoding="utf-8",
+        )
+
+        _file_backups[
+            backup_ref
+        ] = current_source
+
+        result.backup_ref = (
+            backup_ref
+        )
+
+    except Exception as exc:
+
+        result.message = (
+            f"Failed to create backup: "
+            f"{exc}"
+        )
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # Write exact modified source.
+    # -----------------------------------------------------------------------
+
+    try:
+
+        target.write_text(
+            modified_source,
+            encoding="utf-8",
+        )
+
+        written_source = (
+            target.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if written_source != modified_source:
+
+            raise IOError(
+                "Written source does not match "
+                "verified modified source."
+            )
+
         result.success = True
-        result.message = "Patch applied successfully"
-        result.files_modified = [str(target_file)]
 
-        # Record in history
+        result.message = (
+            "Patch applied successfully."
+        )
+
+        result.files_modified = [
+            relative_target_file(
+                str(repo),
+                target_file,
+            )
+        ]
+
         record = PatchRecord(
-            id=f"PATCH-{len(_patch_history) + 1:04d}",
-            investigation_id=investigation_id,
-            file=target_file,
-            patch=patch,
+            id=(
+                f"PATCH-"
+                f"{len(_patch_history) + 1:04d}"
+            ),
+            investigation_id=(
+                investigation_id
+            ),
+            file=relative_target_file(
+                str(repo),
+                target_file,
+            ),
+            patch=(
+                normalize_patch(
+                    patch=patch,
+                    repo_path=str(repo),
+                    target_file=target_file,
+                )
+                if patch
+                else ""
+            ),
             status=PatchStatus.APPLIED,
-            applied_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            applied_at=time.strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            ),
             backup_ref=backup_ref,
         )
-        _patch_history.append(record)
 
-    except Exception as e:
-        # Rollback on failure
-        logger.error("Patch application failed, rolling back: %s", e)
+        _patch_history.append(
+            record
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Patch application failed"
+        )
+
         try:
-            target.write_text(original_content, encoding="utf-8")
+
+            target.write_text(
+                current_source,
+                encoding="utf-8",
+            )
+
         except Exception:
-            pass
-        result.message = f"Patch failed: {e}"
+
+            logger.exception(
+                "Emergency restoration failed"
+            )
+
+        result.message = (
+            f"Patch application failed: "
+            f"{exc}"
+        )
 
     return result
 
 
-def rollback(backup_ref: str, target_file: str, repo_path: str) -> RollbackResult:
-    """Rollback a patch using the backup reference."""
+# ============================================================================
+# ROLLBACK
+# ============================================================================
+
+def rollback(
+    backup_ref: str,
+    target_file: str,
+    repo_path: str,
+) -> RollbackResult:
+
     result = RollbackResult()
 
-    # Try in-memory backup first
-    original = _file_backups.get(backup_ref)
+    if not backup_ref:
 
-    # Then try disk backup
-    if not original:
-        backup_dir = Path(BACKUPS_DIR)
-        for f in backup_dir.glob(f"{backup_ref}_*"):
-            try:
-                original = f.read_text(encoding="utf-8")
-                break
-            except Exception:
-                continue
+        result.message = (
+            "Backup reference is required."
+        )
 
-    if not original:
-        result.message = f"No backup found for reference: {backup_ref}"
         return result
 
-    target = Path(repo_path) / target_file if not Path(target_file).is_absolute() else Path(target_file)
+    try:
+
+        target = resolve_target_file(
+            repo_path,
+            target_file,
+        )
+
+    except ValueError as exc:
+
+        result.message = str(exc)
+        return result
+
+    original = (
+        _file_backups.get(
+            backup_ref
+        )
+    )
+
+    # Try disk backup.
+    if original is None:
+
+        backup_dir = (
+            Path(BACKUPS_DIR)
+            .resolve()
+        )
+
+        matches = list(
+            backup_dir.glob(
+                f"{backup_ref}_*"
+            )
+        )
+
+        if matches:
+
+            try:
+
+                original = (
+                    matches[0]
+                    .read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+            except OSError:
+                original = None
+
+    if original is None:
+
+        result.message = (
+            f"No backup found for reference: "
+            f"{backup_ref}"
+        )
+
+        return result
 
     try:
-        target.write_text(original, encoding="utf-8")
-        result.success = True
-        result.message = "Rollback completed successfully"
 
-        # Update patch history
+        target.write_text(
+            original,
+            encoding="utf-8",
+        )
+
+        restored = (
+            target.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if restored != original:
+
+            raise IOError(
+                "Rollback verification failed."
+            )
+
+        result.success = True
+
+        result.message = (
+            "Rollback completed successfully."
+        )
+
         for record in _patch_history:
-            if record.backup_ref == backup_ref:
-                record.status = PatchStatus.ROLLED_BACK
+
+            if (
+                record.backup_ref
+                == backup_ref
+            ):
+
+                record.status = (
+                    PatchStatus.ROLLED_BACK
+                )
+
                 break
 
-    except Exception as e:
-        result.message = f"Rollback failed: {e}"
+    except Exception as exc:
+
+        result.message = (
+            f"Rollback failed: {exc}"
+        )
 
     return result
 
 
 def get_patch_history() -> list[PatchRecord]:
-    """Get all patch records."""
-    return list(_patch_history)
+    return list(
+        _patch_history
+    )
 
 
-def _is_valid_patch_format(patch: str) -> bool:
-    """Basic validation that this looks like a patch."""
-    lines = patch.strip().splitlines()
-    if not lines:
-        return False
+# ============================================================================
+# UNIFIED DIFF ENGINE
+# ============================================================================
 
-    # It's a unified diff if it has +/- lines
-    has_add = any(l.startswith("+") and not l.startswith("+++") for l in lines)
-    has_remove = any(l.startswith("-") and not l.startswith("---") for l in lines)
-
-    return has_add or has_remove
+_HUNK_RE = re.compile(
+    r"^@@\s+-(\d+)(?:,(\d+))?"
+    r"\s+\+(\d+)(?:,(\d+))?"
+    r"\s+@@"
+)
 
 
-def _check_context_matches(patch: str, target: Path) -> bool:
-    """Check that removed lines in the patch match the current file content."""
-    try:
-        content = target.read_text(encoding="utf-8")
-        lines = content.splitlines()
-
-        for pline in patch.strip().splitlines():
-            if pline.startswith("-") and not pline.startswith("---"):
-                # This line should exist in the file
-                check = pline[1:].strip()
-                if check and not any(check in fl for fl in lines):
-                    return False
-        return True
-    except Exception:
-        return False
-
-
-def _apply_patch_to_content(
-    original: str, patch: str, target_file: str
+def apply_unified_diff(
+    original: str,
+    patch: str,
 ) -> str | None:
-    """Apply a unified diff patch to file content.
-
-    This is a simplified patch applier that handles common cases.
-    For production, use `git apply` or `patch` command.
     """
-    original_lines = original.splitlines(keepends=True)
-    patch_lines = patch.strip().splitlines()
+    Convert original source into modified source.
 
-    # Extract the removed and added lines from the diff
-    remove_lines: list[str] = []
-    add_lines: list[str] = []
+    The implementation uses actual hunk content rather than blindly
+    trusting AI-generated line counts.
+    """
 
-    for pline in patch_lines:
-        if pline.startswith("---") or pline.startswith("+++"):
+    source = (
+        original
+        .replace(
+            "\r\n",
+            "\n",
+        )
+        .replace(
+            "\r",
+            "\n",
+        )
+    )
+
+    source_lines = (
+        source.splitlines()
+    )
+
+    had_final_newline = (
+        source.endswith("\n")
+    )
+
+    text = (
+        patch
+        .replace(
+            "\r\n",
+            "\n",
+        )
+        .replace(
+            "\r",
+            "\n",
+        )
+    )
+
+    patch_lines = (
+        text.splitlines()
+    )
+
+    hunks = []
+
+    current_hunk = None
+
+    for line in patch_lines:
+
+        if line.startswith("--- "):
             continue
-        if pline.startswith("@@"):
-            continue
-        if pline.startswith("-"):
-            remove_lines.append(pline[1:])
-        elif pline.startswith("+"):
-            add_lines.append(pline[1:])
 
-    if not remove_lines and not add_lines:
+        if line.startswith("+++ "):
+            continue
+
+        match = _HUNK_RE.match(
+            line
+        )
+
+        if match:
+
+            if current_hunk is not None:
+                hunks.append(
+                    current_hunk
+                )
+
+            current_hunk = {
+                "old_start": int(
+                    match.group(1)
+                ),
+                "old_count": int(
+                    match.group(2)
+                    or "1"
+                ),
+                "new_start": int(
+                    match.group(3)
+                ),
+                "new_count": int(
+                    match.group(4)
+                    or "1"
+                ),
+                "lines": [],
+            }
+
+            continue
+
+        if current_hunk is None:
+            continue
+
+        if line == (
+            r"\ No newline at end of file"
+        ):
+            continue
+
+        if (
+            line.startswith(" ")
+            or line.startswith("+")
+            or line.startswith("-")
+        ):
+
+            current_hunk[
+                "lines"
+            ].append(
+                line
+            )
+
+        else:
+
+            # Be tolerant when AI omitted a context marker.
+            current_hunk[
+                "lines"
+            ].append(
+                " " + line
+            )
+
+    if current_hunk is not None:
+
+        hunks.append(
+            current_hunk
+        )
+
+    if not hunks:
         return None
 
-    # Find the location of removed lines in the original
-    result_lines = list(original_lines)
+    # Apply from bottom to top.
+    for hunk in reversed(
+        hunks
+    ):
 
-    if remove_lines:
-        start_idx = _find_block(result_lines, remove_lines)
-        if start_idx is None:
+        old_lines = []
+        new_lines = []
+
+        for line in hunk["lines"]:
+
+            prefix = line[0]
+
+            content = line[1:]
+
+            if prefix in (
+                " ",
+                "-",
+            ):
+                old_lines.append(
+                    content
+                )
+
+            if prefix in (
+                " ",
+                "+",
+            ):
+                new_lines.append(
+                    content
+                )
+
+        expected_index = max(
+            0,
+            hunk["old_start"] - 1,
+        )
+
+        location = (
+            find_hunk_location(
+                source_lines=source_lines,
+                expected_index=expected_index,
+                old_lines=old_lines,
+            )
+        )
+
+        if location is None:
+
             return None
 
-        # Detect original indentation from the matched line
-        orig_line = result_lines[start_idx]
-        indent = orig_line[: len(orig_line) - len(orig_line.lstrip())]
+        source_lines[
+            location:
+            location + len(old_lines)
+        ] = new_lines
 
-        formatted_adds = []
-        for l in add_lines:
-            line_str = l.rstrip("\r\n")
-            if line_str.strip() and not line_str.startswith(" ") and not line_str.startswith("\t"):
-                line_str = indent + line_str
-            formatted_adds.append(line_str + "\n")
+    modified = "\n".join(
+        source_lines
+    )
 
-        end_idx = start_idx + len(remove_lines)
-        result_lines[start_idx:end_idx] = formatted_adds
-    else:
-        new_add = [l + "\n" if not l.endswith("\n") else l for l in add_lines]
-        result_lines.extend(new_add)
+    if had_final_newline:
+        modified += "\n"
 
-    return "".join(result_lines)
+    return modified
 
 
+def find_hunk_location(
+    source_lines: list[str],
+    expected_index: int,
+    old_lines: list[str],
+) -> int | None:
+    """Find exact or whitespace-tolerant hunk location."""
 
-def _find_block(lines: list[str], block: list[str]) -> int | None:
-    """Find the starting index of a block of lines in the file."""
-    if not block:
+    if not old_lines:
+
+        return min(
+            max(
+                0,
+                expected_index,
+            ),
+            len(source_lines),
+        )
+
+    # Exact expected location.
+    if (
+        expected_index >= 0
+        and
+        expected_index
+        + len(old_lines)
+        <= len(source_lines)
+    ):
+
+        candidate = source_lines[
+            expected_index:
+            expected_index
+            + len(old_lines)
+        ]
+
+        if candidate == old_lines:
+
+            return expected_index
+
+    # Exact full-file search.
+    maximum = (
+        len(source_lines)
+        - len(old_lines)
+        + 1
+    )
+
+    if maximum <= 0:
         return None
 
-    first = block[0].strip()
-    for i in range(len(lines)):
-        if lines[i].strip() == first:
-            # Check if the rest of the block matches
-            match = True
-            for j, bline in enumerate(block):
-                if i + j >= len(lines):
-                    match = False
-                    break
-                if lines[i + j].strip() != bline.strip():
-                    match = False
-                    break
-            if match:
-                return i
+    for index in range(
+        maximum
+    ):
+
+        candidate = source_lines[
+            index:
+            index
+            + len(old_lines)
+        ]
+
+        if candidate == old_lines:
+
+            return index
+
+    # Whitespace-tolerant search.
+    normalized_old = [
+        line.strip()
+        for line in old_lines
+    ]
+
+    for index in range(
+        maximum
+    ):
+
+        candidate = source_lines[
+            index:
+            index
+            + len(old_lines)
+        ]
+
+        if [
+            line.strip()
+            for line in candidate
+        ] == normalized_old:
+
+            return index
+
     return None
