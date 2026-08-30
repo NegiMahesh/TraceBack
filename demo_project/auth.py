@@ -1,28 +1,41 @@
-def calculate_total(cart):
-    total = 0
-
-    for item in cart:
-        total += item["price"] * item["quantity"]
-
-    return total
+def calculate_average(total_marks, number_of_subjects):
+    if number_of_subjects == 0:
+        return 0
+    return total_marks / number_of_subjects
 
 
-def apply_discount(total, discount):
-    if discount is None:
-        return total
-    return total - (total * discount)
+def get_student(name, total_marks, number_of_subjects):
+    average = calculate_average(
+        total_marks,
+        number_of_subjects
+    )
+
+    return {
+        "name": name,
+        "total_marks": total_marks,
+        "average": average,
+    }
 
 
-cart = [
-    {"name": "Laptop", "price": 60000, "quantity": 1},
-    {"name": "Mouse", "price": 1500, "quantity": 2},
-]
+def get_result(student):
+    if student["average"] >= 40:
+        return "PASS"
 
-total = calculate_total(cart)
+    return "FAIL"
 
-# Intentional bug: discount is None
-discount = None
 
-final_price = apply_discount(total, discount)
+def print_report(student):
+    print("Student:", student["name"])
+    print("Total Marks:", student["total_marks"])
+    print("Average:", student["average"])
+    print("Result:", get_result(student))
 
-print("Final Price:", final_price)
+
+if __name__ == "__main__":
+    student = get_student(
+        "Mahesh",
+        0,
+        0
+    )
+
+    print_report(student)

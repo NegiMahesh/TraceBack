@@ -1,27 +1,18 @@
 """
 TraceBack Patch Service.
 
-The service follows this rule:
+Security principle:
 
-    ORIGINAL SOURCE
-          ↓
-    PATCH PREVIEW
-          ↓
-    MODIFIED SOURCE
-          ↓
-    APPROVAL
-          ↓
-    WRITE EXACT MODIFIED SOURCE
+    AI proposes a patch.
+    TraceBack validates the patch.
+    TraceBack applies only that patch.
 
-The final file written to disk is therefore the exact file that the
-user saw in the Before / After diff.
-
-The service also supports automatic backup and rollback.
+The AI can never directly overwrite the target file with a complete
+replacement source file.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 import time
@@ -38,7 +29,13 @@ from backend.models.patch import (
     RollbackResult,
 )
 
-from backend.services import git_service
+from backend.services import (
+    git_service,
+)
+
+from backend.services.ollama_service import (
+    ollama_service,
+)
 
 
 logger = logging.getLogger(
@@ -46,21 +43,26 @@ logger = logging.getLogger(
 )
 
 
-_patch_history: list[PatchRecord] = []
+_patch_history: list[
+    PatchRecord
+] = []
 
-_file_backups: dict[str, str] = {}
+_file_backups: dict[
+    str,
+    str,
+] = {}
 
 
 # ============================================================================
-# PATH HELPERS
+# PATHS
 # ============================================================================
 
 def resolve_repository(
     repo_path: str,
 ) -> Path:
-    """Resolve repository path."""
 
     if not repo_path:
+
         raise ValueError(
             "Repository path is required."
         )
@@ -71,14 +73,10 @@ def resolve_repository(
         .resolve()
     )
 
-    if not repo.exists():
+    if not repo.is_dir():
+
         raise ValueError(
             f"Repository does not exist: {repo}"
-        )
-
-    if not repo.is_dir():
-        raise ValueError(
-            f"Repository is not a directory: {repo}"
         )
 
     return repo
@@ -88,9 +86,9 @@ def resolve_target_file(
     repo_path: str,
     target_file: str,
 ) -> Path:
-    """Resolve target file and prevent path traversal."""
 
     if not target_file:
+
         raise ValueError(
             "Target file is required."
         )
@@ -105,6 +103,7 @@ def resolve_target_file(
     )
 
     if not candidate.is_absolute():
+
         candidate = (
             repo / candidate
         )
@@ -112,11 +111,13 @@ def resolve_target_file(
     target = candidate.resolve()
 
     try:
+
         target.relative_to(
             repo
         )
 
     except ValueError as exc:
+
         raise ValueError(
             f"Target file is outside repository: "
             f"{target_file}"
@@ -129,7 +130,6 @@ def relative_target_file(
     repo_path: str,
     target_file: str,
 ) -> str:
-    """Return repository-relative POSIX path."""
 
     repo = resolve_repository(
         repo_path
@@ -148,34 +148,6 @@ def relative_target_file(
 
 
 # ============================================================================
-# HASHING
-# ============================================================================
-
-def sha256_text(
-    text: str,
-) -> str:
-    """Calculate SHA-256 for source text."""
-
-    return hashlib.sha256(
-        text.encode(
-            "utf-8"
-        )
-    ).hexdigest()
-
-
-def file_sha256(
-    target: Path,
-) -> str:
-    """Calculate SHA-256 for a file."""
-
-    return sha256_text(
-        target.read_text(
-            encoding="utf-8"
-        )
-    )
-
-
-# ============================================================================
 # PATCH PREVIEW
 # ============================================================================
 
@@ -184,11 +156,9 @@ def preview_patch(
     target_file: str,
     repo_path: str,
 ) -> str:
-    """
-    Generate the exact modified source without changing the file.
-    """
 
     if not patch or not patch.strip():
+
         raise ValueError(
             "Patch is empty."
         )
@@ -199,6 +169,7 @@ def preview_patch(
     )
 
     if not target.is_file():
+
         raise FileNotFoundError(
             f"Target file does not exist: {target}"
         )
@@ -207,25 +178,27 @@ def preview_patch(
         encoding="utf-8"
     )
 
-    normalized_patch = (
-        normalize_patch(
-            patch=patch,
-            repo_path=repo_path,
-            target_file=target_file,
+    normalized = normalize_patch(
+        patch=patch,
+        repo_path=repo_path,
+        target_file=target_file,
+    )
+
+    modified = (
+        apply_unified_diff(
+            original,
+            normalized,
         )
     )
 
-    modified = apply_unified_diff(
-        original=original,
-        patch=normalized_patch,
-    )
-
     if modified is None:
+
         raise ValueError(
             "The patch does not match the current source."
         )
 
     if modified == original:
+
         raise ValueError(
             "The patch produces no actual source change."
         )
@@ -234,120 +207,7 @@ def preview_patch(
 
 
 # ============================================================================
-# PATCH NORMALIZATION
-# ============================================================================
-
-def normalize_patch(
-    patch: str,
-    repo_path: str,
-    target_file: str,
-) -> str:
-    """Normalize AI-generated patch headers."""
-
-    if not patch:
-        return ""
-
-    relative_path = relative_target_file(
-        repo_path,
-        target_file,
-    )
-
-    text = (
-        patch
-        .replace(
-            "\r\n",
-            "\n",
-        )
-        .replace(
-            "\r",
-            "\n",
-        )
-        .strip()
-    )
-
-    # Remove markdown fences.
-    text = re.sub(
-        r"^```(?:diff|patch)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    text = re.sub(
-        r"\s*```$",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    lines = text.splitlines()
-
-    # Locate actual diff.
-    hunk_index = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if line.startswith("@@ ")
-        ),
-        None,
-    )
-
-    old_index = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if line.startswith("--- ")
-        ),
-        None,
-    )
-
-    new_index = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if line.startswith("+++ ")
-        ),
-        None,
-    )
-
-    # No hunk at all.
-    if hunk_index is None:
-        return text
-
-    # Build proper headers.
-    if (
-        old_index is None
-        or new_index is None
-    ):
-
-        body = lines[
-            hunk_index:
-        ]
-
-        lines = [
-            f"--- a/{relative_path}",
-            f"+++ b/{relative_path}",
-            *body,
-        ]
-
-    else:
-
-        lines[old_index] = (
-            f"--- a/{relative_path}"
-        )
-
-        lines[new_index] = (
-            f"+++ b/{relative_path}"
-        )
-
-    return (
-        "\n".join(lines).strip()
-        + "\n"
-    )
-
-
-# ============================================================================
-# VALIDATION
+# VALIDATE
 # ============================================================================
 
 def validate_patch(
@@ -355,7 +215,6 @@ def validate_patch(
     target_file: str,
     repo_path: str,
 ) -> PatchValidation:
-    """Validate patch against current source."""
 
     result = PatchValidation(
         target_file=target_file
@@ -375,13 +234,13 @@ def validate_patch(
     except ValueError as exc:
 
         result.reason = str(exc)
+
         return result
 
     if not target.is_file():
 
         result.reason = (
-            f"Target file does not exist: "
-            f"{target_file}"
+            f"Target file does not exist: {target_file}"
         )
 
         return result
@@ -414,10 +273,25 @@ def validate_patch(
             repo_path=str(repo),
         )
 
+        # Source must actually change.
         if modified == original:
 
             result.reason = (
                 "Patch produces no source change."
+            )
+
+            return result
+
+        # Additional AI safety validation.
+        if not (
+            _structure_is_safe(
+                original,
+                modified,
+            )
+        ):
+
+            result.reason = (
+                "Patch removes unrelated program structure."
             )
 
             return result
@@ -449,15 +323,6 @@ def apply_patch(
     expected_original_sha256: str = "",
     expected_modified_code: str = "",
 ) -> PatchApplyResult:
-    """
-    Apply a patch.
-
-    If expected_modified_code is supplied, it becomes the authoritative
-    source that gets written.
-
-    If expected_original_sha256 is supplied, approval is refused when the
-    file has changed since analysis.
-    """
 
     result = PatchApplyResult()
 
@@ -475,65 +340,64 @@ def apply_patch(
     except ValueError as exc:
 
         result.message = str(exc)
+
         return result
 
     if not target.is_file():
 
         result.message = (
-            f"Target file not found: "
-            f"{target_file}"
+            f"Target file not found: {target_file}"
         )
 
         return result
 
-    # -----------------------------------------------------------------------
-    # Read current source.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # CURRENT SOURCE
+    # ========================================================================
 
     try:
 
-        current_source = (
-            target.read_text(
-                encoding="utf-8"
-            )
+        current_source = target.read_text(
+            encoding="utf-8"
         )
 
     except Exception as exc:
 
         result.message = (
-            f"Could not read target file: "
-            f"{exc}"
+            f"Could not read target file: {exc}"
         )
 
         return result
 
-    current_hash = (
-        sha256_text(
-            current_source
-        )
-    )
+    # ========================================================================
+    # STALE-SOURCE PROTECTION
+    # ========================================================================
 
-    # -----------------------------------------------------------------------
-    # Detect source changing after analysis.
-    # -----------------------------------------------------------------------
+    if expected_original_sha256:
 
-    if (
-        expected_original_sha256
-        and
-        current_hash
-        != expected_original_sha256
-    ):
+        import hashlib
 
-        result.message = (
-            "Patch rejected because the source file "
-            "changed after analysis. Please run a new analysis."
-        )
+        actual_hash = hashlib.sha256(
+            current_source.encode(
+                "utf-8"
+            )
+        ).hexdigest()
 
-        return result
+        if (
+            actual_hash
+            != expected_original_sha256
+        ):
 
-    # -----------------------------------------------------------------------
-    # Determine exact modified source.
-    # -----------------------------------------------------------------------
+            result.message = (
+                "Patch rejected because the file changed "
+                "after analysis. Run a new analysis."
+            )
+
+            return result
+
+    # ========================================================================
+    # BUILD MODIFIED SOURCE
+    # ========================================================================
 
     try:
 
@@ -542,6 +406,15 @@ def apply_patch(
             modified_source = (
                 expected_modified_code
             )
+
+            # Never allow the supplied "modified" source to be empty.
+            if not modified_source.strip():
+
+                result.message = (
+                    "Patch rejected because modified source is empty."
+                )
+
+                return result
 
         else:
 
@@ -555,29 +428,31 @@ def apply_patch(
 
             modified_source = (
                 apply_unified_diff(
-                    original=current_source,
-                    patch=normalized_patch,
+                    current_source,
+                    normalized_patch,
                 )
             )
 
             if modified_source is None:
+
                 result.message = (
-                    "Patch does not match the current source."
+                    "Patch validation failed: "
+                    "the patch does not match the current source."
                 )
+
                 return result
 
     except Exception as exc:
 
         result.message = (
-            f"Could not prepare modified source: "
-            f"{exc}"
+            f"Patch preparation failed: {exc}"
         )
 
         return result
 
-    # -----------------------------------------------------------------------
-    # Validate actual change.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # SOURCE SAFETY
+    # ========================================================================
 
     if modified_source == current_source:
 
@@ -587,9 +462,34 @@ def apply_patch(
 
         return result
 
-    # -----------------------------------------------------------------------
-    # Backup.
-    # -----------------------------------------------------------------------
+    if not _python_is_valid(
+        modified_source
+    ):
+
+        result.message = (
+            "Patch rejected because the resulting file "
+            "contains invalid Python."
+        )
+
+        return result
+
+    safe = _structure_is_safe(
+        current_source,
+        modified_source,
+    )
+
+    if not safe:
+
+        result.message = (
+            "Patch rejected because it removes "
+            "unrelated program structure."
+        )
+
+        return result
+
+    # ========================================================================
+    # BACKUP
+    # ========================================================================
 
     backup_ref = (
         f"backup-{uuid.uuid4().hex[:8]}"
@@ -607,12 +507,12 @@ def apply_patch(
             exist_ok=True,
         )
 
-        backup_file = (
+        backup_path = (
             backup_dir
             / f"{backup_ref}_{target.name}"
         )
 
-        backup_file.write_text(
+        backup_path.write_text(
             current_source,
             encoding="utf-8",
         )
@@ -628,15 +528,14 @@ def apply_patch(
     except Exception as exc:
 
         result.message = (
-            f"Failed to create backup: "
-            f"{exc}"
+            f"Failed to create backup: {exc}"
         )
 
         return result
 
-    # -----------------------------------------------------------------------
-    # Write exact modified source.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # APPLY EXACT VERIFIED SOURCE
+    # ========================================================================
 
     try:
 
@@ -645,17 +544,14 @@ def apply_patch(
             encoding="utf-8",
         )
 
-        written_source = (
-            target.read_text(
-                encoding="utf-8"
-            )
+        written = target.read_text(
+            encoding="utf-8"
         )
 
-        if written_source != modified_source:
+        if written != modified_source:
 
             raise IOError(
-                "Written source does not match "
-                "verified modified source."
+                "Written file differs from validated source."
             )
 
         result.success = True
@@ -685,9 +581,9 @@ def apply_patch(
             ),
             patch=(
                 normalize_patch(
-                    patch=patch,
-                    repo_path=str(repo),
-                    target_file=target_file,
+                    patch,
+                    str(repo),
+                    target_file,
                 )
                 if patch
                 else ""
@@ -719,12 +615,11 @@ def apply_patch(
         except Exception:
 
             logger.exception(
-                "Emergency restoration failed"
+                "Emergency rollback failed"
             )
 
         result.message = (
-            f"Patch application failed: "
-            f"{exc}"
+            f"Patch application failed: {exc}"
         )
 
     return result
@@ -760,6 +655,7 @@ def rollback(
     except ValueError as exc:
 
         result.message = str(exc)
+
         return result
 
     original = (
@@ -768,7 +664,6 @@ def rollback(
         )
     )
 
-    # Try disk backup.
     if original is None:
 
         backup_dir = (
@@ -787,13 +682,13 @@ def rollback(
             try:
 
                 original = (
-                    matches[0]
-                    .read_text(
+                    matches[0].read_text(
                         encoding="utf-8"
                     )
                 )
 
             except OSError:
+
                 original = None
 
     if original is None:
@@ -812,10 +707,8 @@ def rollback(
             encoding="utf-8",
         )
 
-        restored = (
-            target.read_text(
-                encoding="utf-8"
-            )
+        restored = target.read_text(
+            encoding="utf-8"
         )
 
         if restored != original:
@@ -852,14 +745,124 @@ def rollback(
     return result
 
 
-def get_patch_history() -> list[PatchRecord]:
+def get_patch_history() -> list[
+    PatchRecord
+]:
+
     return list(
         _patch_history
     )
 
 
 # ============================================================================
-# UNIFIED DIFF ENGINE
+# PATCH NORMALIZATION
+# ============================================================================
+
+def normalize_patch(
+    patch: str,
+    repo_path: str,
+    target_file: str,
+) -> str:
+
+    if not patch:
+
+        return ""
+
+    relative = relative_target_file(
+        repo_path,
+        target_file,
+    )
+
+    text = (
+        patch
+        .replace(
+            "\r\n",
+            "\n",
+        )
+        .replace(
+            "\r",
+            "\n",
+        )
+        .strip()
+    )
+
+    # Remove markdown fences.
+    text = re.sub(
+        r"^```(?:diff|patch)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    lines = text.splitlines()
+
+    old_found = False
+    new_found = False
+
+    for index, line in enumerate(
+        lines
+    ):
+
+        if line.startswith(
+            "--- "
+        ):
+
+            lines[index] = (
+                f"--- a/{relative}"
+            )
+
+            old_found = True
+
+        elif line.startswith(
+            "+++ "
+        ):
+
+            lines[index] = (
+                f"+++ b/{relative}"
+            )
+
+            new_found = True
+
+    hunk_index = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("@@ ")
+        ),
+        None,
+    )
+
+    if (
+        hunk_index is not None
+        and
+        not (
+            old_found
+            and
+            new_found
+        )
+    ):
+
+        lines = [
+            f"--- a/{relative}",
+            f"+++ b/{relative}",
+            *lines[hunk_index:],
+        ]
+
+    return (
+        "\n".join(lines).strip()
+        + "\n"
+    )
+
+
+# ============================================================================
+# UNIFIED DIFF APPLICATION
 # ============================================================================
 
 _HUNK_RE = re.compile(
@@ -873,12 +876,6 @@ def apply_unified_diff(
     original: str,
     patch: str,
 ) -> str | None:
-    """
-    Convert original source into modified source.
-
-    The implementation uses actual hunk content rather than blindly
-    trusting AI-generated line counts.
-    """
 
     source = (
         original
@@ -896,11 +893,11 @@ def apply_unified_diff(
         source.splitlines()
     )
 
-    had_final_newline = (
+    final_newline = (
         source.endswith("\n")
     )
 
-    text = (
+    patch_lines = (
         patch
         .replace(
             "\r\n",
@@ -910,22 +907,23 @@ def apply_unified_diff(
             "\r",
             "\n",
         )
-    )
-
-    patch_lines = (
-        text.splitlines()
+        .splitlines()
     )
 
     hunks = []
 
-    current_hunk = None
+    current = None
 
     for line in patch_lines:
 
-        if line.startswith("--- "):
+        if line.startswith(
+            "--- "
+        ):
             continue
 
-        if line.startswith("+++ "):
+        if line.startswith(
+            "+++ "
+        ):
             continue
 
         match = _HUNK_RE.match(
@@ -934,12 +932,12 @@ def apply_unified_diff(
 
         if match:
 
-            if current_hunk is not None:
+            if current is not None:
                 hunks.append(
-                    current_hunk
+                    current
                 )
 
-            current_hunk = {
+            current = {
                 "old_start": int(
                     match.group(1)
                 ),
@@ -947,19 +945,12 @@ def apply_unified_diff(
                     match.group(2)
                     or "1"
                 ),
-                "new_start": int(
-                    match.group(3)
-                ),
-                "new_count": int(
-                    match.group(4)
-                    or "1"
-                ),
                 "lines": [],
             }
 
             continue
 
-        if current_hunk is None:
+        if current is None:
             continue
 
         if line == (
@@ -967,13 +958,15 @@ def apply_unified_diff(
         ):
             continue
 
-        if (
-            line.startswith(" ")
-            or line.startswith("+")
-            or line.startswith("-")
+        if line.startswith(
+            (
+                " ",
+                "+",
+                "-",
+            )
         ):
 
-            current_hunk[
+            current[
                 "lines"
             ].append(
                 line
@@ -981,23 +974,21 @@ def apply_unified_diff(
 
         else:
 
-            # Be tolerant when AI omitted a context marker.
-            current_hunk[
+            current[
                 "lines"
             ].append(
                 " " + line
             )
 
-    if current_hunk is not None:
-
+    if current is not None:
         hunks.append(
-            current_hunk
+            current
         )
 
     if not hunks:
         return None
 
-    # Apply from bottom to top.
+    # Apply bottom-to-top.
     for hunk in reversed(
         hunks
     ):
@@ -1005,16 +996,18 @@ def apply_unified_diff(
         old_lines = []
         new_lines = []
 
-        for line in hunk["lines"]:
+        for line in hunk[
+            "lines"
+        ]:
 
             prefix = line[0]
-
             content = line[1:]
 
             if prefix in (
                 " ",
                 "-",
             ):
+
                 old_lines.append(
                     content
                 )
@@ -1023,20 +1016,21 @@ def apply_unified_diff(
                 " ",
                 "+",
             ):
+
                 new_lines.append(
                     content
                 )
 
-        expected_index = max(
+        expected = max(
             0,
             hunk["old_start"] - 1,
         )
 
         location = (
-            find_hunk_location(
-                source_lines=source_lines,
-                expected_index=expected_index,
-                old_lines=old_lines,
+            _find_location(
+                source_lines,
+                expected,
+                old_lines,
             )
         )
 
@@ -1046,56 +1040,57 @@ def apply_unified_diff(
 
         source_lines[
             location:
-            location + len(old_lines)
+            location
+            + len(old_lines)
         ] = new_lines
 
     modified = "\n".join(
         source_lines
     )
 
-    if had_final_newline:
+    if final_newline:
+
         modified += "\n"
 
     return modified
 
 
-def find_hunk_location(
+def _find_location(
     source_lines: list[str],
-    expected_index: int,
+    expected: int,
     old_lines: list[str],
 ) -> int | None:
-    """Find exact or whitespace-tolerant hunk location."""
 
     if not old_lines:
 
         return min(
             max(
                 0,
-                expected_index,
+                expected,
             ),
             len(source_lines),
         )
 
     # Exact expected location.
     if (
-        expected_index >= 0
+        expected >= 0
         and
-        expected_index
+        expected
         + len(old_lines)
         <= len(source_lines)
     ):
 
-        candidate = source_lines[
-            expected_index:
-            expected_index
-            + len(old_lines)
-        ]
+        if (
+            source_lines[
+                expected:
+                expected + len(old_lines)
+            ]
+            == old_lines
+        ):
 
-        if candidate == old_lines:
+            return expected
 
-            return expected_index
-
-    # Exact full-file search.
+    # Exact search.
     maximum = (
         len(source_lines)
         - len(old_lines)
@@ -1109,18 +1104,18 @@ def find_hunk_location(
         maximum
     ):
 
-        candidate = source_lines[
-            index:
-            index
-            + len(old_lines)
-        ]
-
-        if candidate == old_lines:
+        if (
+            source_lines[
+                index:
+                index + len(old_lines)
+            ]
+            == old_lines
+        ):
 
             return index
 
-    # Whitespace-tolerant search.
-    normalized_old = [
+    # Whitespace-tolerant.
+    expected_normalized = [
         line.strip()
         for line in old_lines
     ]
@@ -1131,15 +1126,311 @@ def find_hunk_location(
 
         candidate = source_lines[
             index:
-            index
-            + len(old_lines)
+            index + len(old_lines)
         ]
 
         if [
             line.strip()
             for line in candidate
-        ] == normalized_old:
+        ] == expected_normalized:
 
             return index
 
     return None
+
+
+# ============================================================================
+# SAFETY
+# ============================================================================
+
+def _python_is_valid(
+    source: str,
+) -> bool:
+
+    if not source.strip():
+        return False
+
+    try:
+
+        import ast
+
+        ast.parse(
+            source
+        )
+
+        return True
+
+    except SyntaxError:
+
+        return False
+
+
+def _structure_is_safe(
+    original: str,
+    modified: str,
+) -> bool:
+
+    import ast
+
+    try:
+
+        old_tree = ast.parse(
+            original
+        )
+
+        new_tree = ast.parse(
+            modified
+        )
+
+    except SyntaxError:
+
+        return False
+
+    old_functions = {
+        node.name
+        for node in old_tree.body
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        )
+    }
+
+    new_functions = {
+        node.name
+        for node in new_tree.body
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        )
+    }
+
+    # Never silently delete functions.
+    if (
+        old_functions
+        - new_functions
+    ):
+
+        return False
+
+    old_classes = {
+        node.name
+        for node in old_tree.body
+        if isinstance(
+            node,
+            ast.ClassDef,
+        )
+    }
+
+    new_classes = {
+        node.name
+        for node in new_tree.body
+        if isinstance(
+            node,
+            ast.ClassDef,
+        )
+    }
+
+    if (
+        old_classes
+        - new_classes
+    ):
+
+        return False
+
+    # Never remove the __main__ block.
+    old_has_main = (
+        _has_main_guard(
+            old_tree
+        )
+    )
+
+    new_has_main = (
+        _has_main_guard(
+            new_tree
+        )
+    )
+
+    if (
+        old_has_main
+        and
+        not new_has_main
+    ):
+
+        return False
+
+    # Protect imports.
+    old_imports = {
+        _import_signature(
+            node
+        )
+        for node in old_tree.body
+        if isinstance(
+            node,
+            (
+                ast.Import,
+                ast.ImportFrom,
+            ),
+        )
+    }
+
+    new_imports = {
+        _import_signature(
+            node
+        )
+        for node in new_tree.body
+        if isinstance(
+            node,
+            (
+                ast.Import,
+                ast.ImportFrom,
+            ),
+        )
+    }
+
+    if (
+        old_imports
+        - new_imports
+    ):
+
+        return False
+
+    # A meaningful program should not suddenly become tiny.
+    old_lines = [
+        line
+        for line in original.splitlines()
+        if line.strip()
+    ]
+
+    new_lines = [
+        line
+        for line in modified.splitlines()
+        if line.strip()
+    ]
+
+    if (
+        len(old_lines) >= 10
+        and
+        len(new_lines)
+        < max(
+            5,
+            int(
+                len(old_lines)
+                * 0.50
+            ),
+        )
+    ):
+
+        return False
+
+    return True
+
+
+def _has_main_guard(
+    tree,
+) -> bool:
+
+    import ast
+
+    for node in tree.body:
+
+        if not isinstance(
+            node,
+            ast.If,
+        ):
+
+            continue
+
+        test = node.test
+
+        if not isinstance(
+            test,
+            ast.Compare,
+        ):
+
+            continue
+
+        if not isinstance(
+            test.left,
+            ast.Name,
+        ):
+
+            continue
+
+        if (
+            test.left.id
+            != "__name__"
+        ):
+
+            continue
+
+        if not test.comparators:
+            continue
+
+        comparator = (
+            test.comparators[0]
+        )
+
+        if (
+            isinstance(
+                comparator,
+                ast.Constant,
+            )
+            and
+            comparator.value
+            == "__main__"
+        ):
+
+            return True
+
+    return False
+
+
+def _import_signature(
+    node,
+) -> str:
+
+    import ast
+
+    if isinstance(
+        node,
+        ast.Import,
+    ):
+
+        return (
+            "import:"
+            +
+            ",".join(
+                alias.name
+                for alias
+                in node.names
+            )
+        )
+
+    if isinstance(
+        node,
+        ast.ImportFrom,
+    ):
+
+        return (
+            "from:"
+            +
+            str(
+                node.module
+            )
+            +
+            ":"
+            +
+            ",".join(
+                alias.name
+                for alias
+                in node.names
+            )
+        )
+
+    return ""

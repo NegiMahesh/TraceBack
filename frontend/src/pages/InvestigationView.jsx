@@ -134,10 +134,10 @@ export default function InvestigationView({
             report.steps
           )
             ? report.steps.find(
-                (step) =>
-                  step.status ===
-                  'failed'
-              )
+              (step) =>
+                step.status ===
+                'failed'
+            )
             : null;
 
         onShowToast({
@@ -220,7 +220,7 @@ export default function InvestigationView({
           id,
           backupRef,
           investigation.repo_path ||
-            null
+          null
         );
 
       if (!result.success) {
@@ -279,7 +279,7 @@ export default function InvestigationView({
         await api.runTests(
           '',
           investigation.repo_path ||
-            null
+          null
         );
 
       onShowToast({
@@ -363,13 +363,12 @@ export default function InvestigationView({
         </div>
 
         <span
-          className={`px-3 py-1 rounded-full text-xs font-mono font-bold uppercase tracking-wider ${
-            status === 'VERIFIED'
+          className={`px-3 py-1 rounded-full text-xs font-mono font-bold uppercase tracking-wider ${status === 'VERIFIED'
               ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
               : status === 'FAILED'
-              ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-              : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
-          }`}
+                ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+            }`}
         >
           {status}
         </span>
@@ -382,10 +381,7 @@ export default function InvestigationView({
       ========================================================== */}
 
       <InvestigationTimeline
-        currentStep={stepIndex}
-        isComplete={
-          status === 'VERIFIED'
-        }
+        investigation={investigation}
       />
 
 
@@ -456,11 +452,10 @@ export default function InvestigationView({
                       tab.id
                     )
                   }
-                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
-                    active
+                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${active
                       ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30 shadow-sm'
                       : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-                  }`}
+                    }`}
                 >
                   <Icon className="w-3.5 h-3.5" />
 

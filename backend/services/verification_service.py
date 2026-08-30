@@ -1,22 +1,39 @@
 """
-TraceBack deterministic verification service.
+TraceBack Autonomous Verification Service.
 
-The service verifies the EXACT modified source produced during analysis.
+Verification pipeline:
 
-Pipeline:
+    Apply Fix
+       ↓
+    Run Repaired File
+       ↓
+    Still crashes?
+       ↓
+    AI Repair #2
+       ↓
+    Run Again
+       ↓
+    AI Repair #3
+       ↓
+    Run Again
+       ↓
+    FIX VERIFIED
 
-1. Baseline tests
-2. Verify source has not changed since analysis
-3. Apply frozen modified source
-4. Run repaired application
-5. Run existing tests
-6. Compare against baseline
-7. Verify or rollback
+The project-wide baseline/existing pytest stages are intentionally disabled
+for the main TraceBack demo pipeline.
+
+Why?
+
+The TraceBack demo should focus on whether the proposed repair actually
+fixes the reported crash and whether the repaired file executes correctly.
+
+Automatic rollback remains enabled whenever verification fails.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from backend.models.analysis import (
@@ -30,13 +47,30 @@ from backend.services import (
     test_service,
 )
 
+from backend.services.ollama_service import (
+    ollama_service,
+)
+
+from backend.services.traceback_parser import (
+    is_traceback,
+    parse_traceback,
+)
+
+
 logger = logging.getLogger(
     "traceback.verification"
 )
 
 
 # ============================================================================
-# MAIN
+# CONFIGURATION
+# ============================================================================
+
+MAX_REPAIR_ATTEMPTS = 3
+
+
+# ============================================================================
+# MAIN VERIFICATION
 # ============================================================================
 
 async def verify_fix(
@@ -52,420 +86,840 @@ async def verify_fix(
 
     report = VerificationReport()
 
-    # ========================================================================
-    # STEP 1 — BASELINE
-    # ========================================================================
-
-    baseline_step = VerificationStep(
-        name="Baseline Tests",
-        status="running",
+    logger.info(
+        "============================================================"
     )
 
-    report.steps.append(
-        baseline_step
+    logger.info(
+        "TRACEBACK VERIFICATION START"
     )
 
-    started = time.time()
-
-    try:
-
-        baseline_result = (
-            test_service.run_pytest(
-                cwd=repo_path,
-                timeout=120,
-            )
-        )
-
-        baseline_step.duration_ms = int(
-            (time.time() - started)
-            * 1000
-        )
-
-        if baseline_result.success:
-
-            baseline_step.status = (
-                "passed"
-            )
-
-            baseline_step.message = (
-                f"{baseline_result.passed} "
-                f"existing test(s) passed before patch."
-            )
-
-        elif (
-            baseline_result.exit_code
-            == 5
-        ):
-
-            baseline_step.status = (
-                "warning"
-            )
-
-            baseline_step.message = (
-                "No existing pytest tests were collected."
-            )
-
-        else:
-
-            baseline_step.status = (
-                "warning"
-            )
-
-            baseline_step.message = (
-                "Pre-existing test failures detected: "
-                + _failure_names(
-                    baseline_result
-                )
-            )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Baseline test failure"
-        )
-
-        baseline_result = None
-
-        baseline_step.status = (
-            "warning"
-        )
-
-        baseline_step.message = (
-            f"Could not establish baseline: {exc}"
-        )
-
-    # ========================================================================
-    # STEP 2 — APPLY FROZEN SOURCE
-    # ========================================================================
-
-    patch_step = VerificationStep(
-        name="Patch Applied",
-        status="running",
+    logger.info(
+        "Investigation: %s",
+        investigation_id,
     )
 
-    report.steps.append(
-        patch_step
+    logger.info(
+        "Target: %s",
+        target_file,
     )
 
-    started = time.time()
-
-    apply_result = (
-        patch_service.apply_patch(
-            patch=patch,
-            target_file=target_file,
-            repo_path=repo_path,
-            investigation_id=investigation_id,
-            expected_original_sha256=(
-                expected_original_sha256
-            ),
-            expected_modified_code=(
-                expected_modified_code
-            ),
-        )
-    )
-
-    patch_step.duration_ms = int(
-        (time.time() - started)
-        * 1000
-    )
-
-    if not apply_result.success:
-
-        patch_step.status = (
-            "failed"
-        )
-
-        patch_step.message = (
-            apply_result.message
-        )
-
-        report.verdict = (
-            "PATCH FAILED"
-        )
-
-        return report
-
-    patch_step.status = (
-        "passed"
-    )
-
-    patch_step.message = (
-        "Patch applied successfully."
-    )
-
-    backup_ref = (
-        apply_result.backup_ref
-    )
-
-    report.backup_ref = (
-        backup_ref
+    logger.info(
+        "============================================================"
     )
 
     # ========================================================================
-    # STEP 3 — REPAIRED FILE EXECUTION
+    # INITIAL STATE
     # ========================================================================
 
-    if crash_file:
+    current_patch = patch or ""
 
-        regression_step = VerificationStep(
-            name="Regression Test",
+    current_modified_source = (
+        expected_modified_code or ""
+    )
+
+    current_crash_file = (
+        crash_file
+        or target_file
+    )
+
+    first_backup_ref = ""
+
+    # ========================================================================
+    # AUTONOMOUS REPAIR LOOP
+    # ========================================================================
+
+    for attempt in range(
+        1,
+        MAX_REPAIR_ATTEMPTS + 1,
+    ):
+
+        logger.info(
+            "------------------------------------------------------------"
+        )
+
+        logger.info(
+            "REPAIR ATTEMPT %s/%s",
+            attempt,
+            MAX_REPAIR_ATTEMPTS,
+        )
+
+        logger.info(
+            "------------------------------------------------------------"
+        )
+
+        # ====================================================================
+        # PATCH
+        # ====================================================================
+
+        patch_step_name = (
+            "Patch Applied"
+            if attempt == 1
+            else f"Autonomous Repair #{attempt}"
+        )
+
+        patch_step = VerificationStep(
+            name=patch_step_name,
             status="running",
         )
 
         report.steps.append(
-            regression_step
+            patch_step
         )
 
         started = time.time()
 
         try:
 
+            use_frozen_source = (
+                attempt == 1
+                and
+                bool(
+                    current_modified_source
+                )
+            )
+
+            apply_result = (
+                patch_service.apply_patch(
+                    patch=current_patch,
+                    target_file=target_file,
+                    repo_path=repo_path,
+                    investigation_id=investigation_id,
+                    expected_original_sha256=(
+                        expected_original_sha256
+                        if attempt == 1
+                        else ""
+                    ),
+                    expected_modified_code=(
+                        current_modified_source
+                        if use_frozen_source
+                        else ""
+                    ),
+                )
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Patch application failed."
+            )
+
+            patch_step.duration_ms = int(
+                (time.time() - started)
+                * 1000
+            )
+
+            patch_step.status = (
+                "failed"
+            )
+
+            patch_step.message = (
+                f"Patch application error: {exc}"
+            )
+
+            if first_backup_ref:
+
+                _rollback(
+                    report=report,
+                    backup_ref=first_backup_ref,
+                    target_file=target_file,
+                    repo_path=repo_path,
+                )
+
+            report.verdict = (
+                "PATCH FAILED"
+            )
+
+            report.overall_success = False
+
+            return report
+
+        patch_step.duration_ms = int(
+            (time.time() - started)
+            * 1000
+        )
+
+        if (
+            apply_result is None
+            or
+            not apply_result.success
+        ):
+
+            patch_step.status = (
+                "failed"
+            )
+
+            patch_step.message = (
+                apply_result.message
+                if apply_result is not None
+                else "Patch application failed."
+            )
+
+            logger.error(
+                "Patch attempt %s failed: %s",
+                attempt,
+                patch_step.message,
+            )
+
+            if first_backup_ref:
+
+                _rollback(
+                    report=report,
+                    backup_ref=first_backup_ref,
+                    target_file=target_file,
+                    repo_path=repo_path,
+                )
+
+            report.verdict = (
+                "PATCH FAILED"
+            )
+
+            report.overall_success = False
+
+            return report
+
+        patch_step.status = (
+            "passed"
+        )
+
+        patch_step.message = (
+            "Patch applied successfully."
+        )
+
+        if not first_backup_ref:
+
+            first_backup_ref = (
+                apply_result.backup_ref
+            )
+
+            report.backup_ref = (
+                first_backup_ref
+            )
+
+        # ====================================================================
+        # EXECUTE REPAIRED FILE
+        # ====================================================================
+
+        execution_step_name = (
+            "Regression Test"
+            if attempt == 1
+            else f"Repair Validation #{attempt}"
+        )
+
+        execution_step = VerificationStep(
+            name=execution_step_name,
+            status="running",
+        )
+
+        report.steps.append(
+            execution_step
+        )
+
+        started = time.time()
+
+        logger.info(
+            "Executing repaired file: %s",
+            current_crash_file,
+        )
+
+        try:
+
+            # --------------------------------------------------------------
+            # HARD SAFETY CHECK
+            # --------------------------------------------------------------
+
+            current_target = (
+                patch_service.resolve_target_file(
+                    repo_path,
+                    current_crash_file,
+                )
+            )
+
+            current_source = (
+                current_target.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            if not current_source.strip():
+
+                execution_step.status = (
+                    "failed"
+                )
+
+                execution_step.message = (
+                    "Safety check blocked verification: "
+                    "repaired source is empty."
+                )
+
+                execution_step.duration_ms = int(
+                    (time.time() - started)
+                    * 1000
+                )
+
+                _rollback(
+                    report=report,
+                    backup_ref=first_backup_ref,
+                    target_file=target_file,
+                    repo_path=repo_path,
+                )
+
+                report.verdict = (
+                    "VERIFICATION FAILED"
+                )
+
+                report.overall_success = False
+
+                return report
+
+            # --------------------------------------------------------------
+            # Execute repaired source
+            # --------------------------------------------------------------
+
             direct_result = (
                 test_service.run_python_file(
-                    file_path=crash_file,
+                    file_path=current_crash_file,
                     cwd=repo_path,
                     timeout=30,
                 )
             )
 
-            report.generated_test_result = (
-                _python_to_test_result(
-                    direct_result
-                )
+        except Exception as exc:
+
+            logger.exception(
+                "Repaired file execution failed."
             )
 
-            regression_step.duration_ms = int(
+            execution_step.status = (
+                "failed"
+            )
+
+            execution_step.message = (
+                f"Execution error: {exc}"
+            )
+
+            execution_step.duration_ms = int(
                 (time.time() - started)
                 * 1000
             )
 
-            if not direct_result.get(
-                "crashed",
-                True,
-            ):
-
-                regression_step.status = (
-                    "passed"
-                )
-
-                regression_step.message = (
-                    "Repaired file executes successfully."
-                )
-
-            else:
-
-                regression_step.status = (
-                    "failed"
-                )
-
-                regression_step.message = (
-                    _python_failure(
-                        direct_result
-                    )
-                )
-
-                _rollback(
-                    report,
-                    backup_ref,
-                    target_file,
-                    repo_path,
-                )
-
-                return report
-
-        except Exception as exc:
-
-            logger.exception(
-                "Regression execution failed"
-            )
-
-            regression_step.status = (
-                "failed"
-            )
-
-            regression_step.message = (
-                f"Regression test failed: {exc}"
-            )
-
             _rollback(
-                report,
-                backup_ref,
-                target_file,
-                repo_path,
+                report=report,
+                backup_ref=first_backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
             )
+
+            report.verdict = (
+                "VERIFICATION FAILED"
+            )
+
+            report.overall_success = False
 
             return report
 
-    else:
-
-        report.steps.append(
-            VerificationStep(
-                name="Regression Test",
-                status="skipped",
-                message=(
-                    "No crash file was supplied."
-                ),
-            )
-        )
-
-    # ========================================================================
-    # STEP 4 — EXISTING TESTS
-    # ========================================================================
-
-    existing_step = VerificationStep(
-        name="Existing Tests",
-        status="running",
-    )
-
-    report.steps.append(
-        existing_step
-    )
-
-    started = time.time()
-
-    try:
-
-        existing_result = (
-            test_service.run_pytest(
-                cwd=repo_path,
-                timeout=120,
-            )
-        )
-
-        report.existing_test_result = (
-            existing_result
-        )
-
-        existing_step.duration_ms = int(
+        execution_step.duration_ms = int(
             (time.time() - started)
             * 1000
         )
 
-    except Exception as exc:
-
-        logger.exception(
-            "Existing test execution failed"
-        )
-
-        existing_result = None
-
-        existing_step.status = (
-            "warning"
-        )
-
-        existing_step.message = (
-            f"Could not execute existing tests: {exc}"
-        )
-
-    if existing_result is None:
-
-        pass
-
-    elif existing_result.success:
-
-        existing_step.status = (
-            "passed"
-        )
-
-        existing_step.message = (
-            f"{existing_result.passed} "
-            f"existing test(s) passed."
-        )
-
-    elif existing_result.exit_code == 5:
-
-        existing_step.status = (
-            "warning"
-        )
-
-        existing_step.message = (
-            "No existing pytest tests were collected."
-        )
-
-    else:
-
-        before_failures = (
-            _extract_test_failures(
-                baseline_result
-            )
-            if baseline_result
-            else set()
-        )
-
-        after_failures = (
-            _extract_test_failures(
-                existing_result
+        report.generated_test_result = (
+            _python_to_test_result(
+                direct_result
             )
         )
 
-        new_failures = (
-            after_failures
-            - before_failures
-        )
+        # ====================================================================
+        # EXECUTION PASSED
+        # ====================================================================
 
-        if (
-            baseline_result
-            and
-            not baseline_result.success
-            and
-            not new_failures
+        if not direct_result.get(
+            "crashed",
+            True,
         ):
 
-            existing_step.status = (
-                "warning"
+            execution_step.status = (
+                "passed"
             )
 
-            existing_step.message = (
-                "Pre-existing test failures remain; "
-                "no new regression was introduced."
+            execution_step.message = (
+                "Repaired file executes successfully."
             )
 
-        else:
-
-            existing_step.status = (
-                "failed"
+            logger.info(
+                "Repair attempt %s succeeded.",
+                attempt,
             )
 
-            if new_failures:
+            break
 
-                existing_step.message = (
-                    "New regression detected: "
-                    + ", ".join(
-                        sorted(
-                            new_failures
-                        )
-                    )
-                )
+        # ====================================================================
+        # EXECUTION FAILED
+        # ====================================================================
 
-            else:
+        execution_step.status = (
+            "failed"
+        )
 
-                existing_step.message = (
-                    _best_test_error(
-                        existing_result
-                    )
-                )
+        failure_message = (
+            _python_failure(
+                direct_result
+            )
+        )
+
+        execution_step.message = (
+            failure_message
+        )
+
+        logger.warning(
+            "Repair attempt %s still crashes:\n%s",
+            attempt,
+            failure_message,
+        )
+
+        # ====================================================================
+        # MAX ATTEMPTS
+        # ====================================================================
+
+        if (
+            attempt
+            >=
+            MAX_REPAIR_ATTEMPTS
+        ):
 
             _rollback(
-                report,
-                backup_ref,
-                target_file,
-                repo_path,
+                report=report,
+                backup_ref=first_backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
+            )
+
+            report.verdict = (
+                "VERIFICATION FAILED"
+            )
+
+            report.overall_success = False
+
+            return report
+
+        # ====================================================================
+        # CAPTURE NEW TRACEBACK
+        # ====================================================================
+
+        new_traceback = str(
+            direct_result.get(
+                "stderr",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not new_traceback:
+
+            new_traceback = str(
+                direct_result.get(
+                    "stdout",
+                    "",
+                )
+                or ""
+            ).strip()
+
+        logger.info(
+            "New traceback captured:\n%s",
+            new_traceback[:5000],
+        )
+
+        if not is_traceback(
+            new_traceback
+        ):
+
+            execution_step.message += (
+                " TraceBack could not identify "
+                "a new Python traceback."
+            )
+
+            _rollback(
+                report=report,
+                backup_ref=first_backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
+            )
+
+            report.verdict = (
+                "VERIFICATION FAILED"
             )
 
             return report
 
-    # ========================================================================
-    # STEP 5 — VERIFIED
-    # ========================================================================
+        # ====================================================================
+        # PARSE NEW TRACEBACK
+        # ====================================================================
+
+        try:
+
+            new_parsed = (
+                parse_traceback(
+                    new_traceback
+                )
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "New traceback parsing failed."
+            )
+
+            repair_step = VerificationStep(
+                name=(
+                    f"AI Repair Generation #{attempt + 1}"
+                ),
+                status="failed",
+                message=(
+                    f"Could not parse new traceback: {exc}"
+                ),
+            )
+
+            report.steps.append(
+                repair_step
+            )
+
+            _rollback(
+                report=report,
+                backup_ref=first_backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
+            )
+
+            report.verdict = (
+                "VERIFICATION FAILED"
+            )
+
+            return report
+
+        # ====================================================================
+        # READ CURRENT SOURCE
+        # ====================================================================
+
+        try:
+
+            current_target = (
+                patch_service.resolve_target_file(
+                    repo_path,
+                    target_file,
+                )
+            )
+
+            current_source = (
+                current_target.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Could not read current repaired source."
+            )
+
+            repair_step = VerificationStep(
+                name=(
+                    f"AI Repair Generation #{attempt + 1}"
+                ),
+                status="failed",
+                message=(
+                    f"Could not read repaired source: {exc}"
+                ),
+            )
+
+            report.steps.append(
+                repair_step
+            )
+
+            _rollback(
+                report=report,
+                backup_ref=first_backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
+            )
+
+            report.verdict = (
+                "VERIFICATION FAILED"
+            )
+
+            return report
+
+        # ====================================================================
+        # ASK AI FOR NEXT REPAIR
+        # ====================================================================
+
+        logger.info(
+            "Requesting autonomous AI repair #%s",
+            attempt + 1,
+        )
+
+        try:
+
+            ai_result = (
+                await ollama_service.analyze_crash(
+                    error_type=(
+                        new_parsed.error_type
+                    ),
+                    error_message=(
+                        new_parsed.message
+                    ),
+                    source_code=(
+                        current_source
+                    ),
+                    file_path=(
+                        target_file
+                    ),
+                    line_number=(
+                        new_parsed.line
+                    ),
+                    function_name=(
+                        new_parsed.function
+                    ),
+                    git_blame="",
+                    traceback_raw=(
+                        new_traceback
+                    ),
+                )
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Autonomous AI repair failed."
+            )
+
+            repair_step = VerificationStep(
+                name=(
+                    f"AI Repair Generation #{attempt + 1}"
+                ),
+                status="failed",
+                message=(
+                    f"AI repair failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+
+            report.steps.append(
+                repair_step
+            )
+
+            _rollback(
+                report=report,
+                backup_ref=first_backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
+            )
+
+            report.verdict = (
+                "VERIFICATION FAILED"
+            )
+
+            return report
+
+        if ai_result is None:
+
+            repair_step = VerificationStep(
+                name=(
+                    f"AI Repair Generation #{attempt + 1}"
+                ),
+                status="failed",
+                message=(
+                    "AI returned no repair result."
+                ),
+            )
+
+            report.steps.append(
+                repair_step
+            )
+
+            _rollback(
+                report=report,
+                backup_ref=first_backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
+            )
+
+            report.verdict = (
+                "VERIFICATION FAILED"
+            )
+
+            return report
+
+        next_patch = str(
+            getattr(
+                ai_result,
+                "patch",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not next_patch:
+
+            repair_step = VerificationStep(
+                name=(
+                    f"AI Repair Generation #{attempt + 1}"
+                ),
+                status="failed",
+                message=(
+                    "AI analyzed the new crash but "
+                    "did not produce a safe patch."
+                ),
+            )
+
+            report.steps.append(
+                repair_step
+            )
+
+            _rollback(
+                report=report,
+                backup_ref=first_backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
+            )
+
+            report.verdict = (
+                "VERIFICATION FAILED"
+            )
+
+            return report
+
+        # ====================================================================
+        # VALIDATE NEXT PATCH
+        # ====================================================================
+
+        try:
+
+            normalized_next_patch = (
+                patch_service.normalize_patch(
+                    patch=next_patch,
+                    repo_path=repo_path,
+                    target_file=target_file,
+                )
+            )
+
+            next_modified_source = (
+                patch_service.apply_unified_diff(
+                    original=current_source,
+                    patch=normalized_next_patch,
+                )
+            )
+
+            if next_modified_source is None:
+
+                raise ValueError(
+                    "The next patch does not match "
+                    "the current repaired source."
+                )
+
+            if (
+                next_modified_source
+                == current_source
+            ):
+
+                raise ValueError(
+                    "The next patch produces no source change."
+                )
+
+        except Exception as exc:
+
+            repair_step = VerificationStep(
+                name=(
+                    f"AI Repair Generation #{attempt + 1}"
+                ),
+                status="failed",
+                message=(
+                    f"Generated repair rejected: {exc}"
+                ),
+            )
+
+            report.steps.append(
+                repair_step
+            )
+
+            _rollback(
+                report=report,
+                backup_ref=first_backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
+            )
+
+            report.verdict = (
+                "VERIFICATION FAILED"
+            )
+
+            return report
+
+        repair_step = VerificationStep(
+            name=(
+                f"AI Repair Generation #{attempt + 1}"
+            ),
+            status="passed",
+            message=(
+                "AI analyzed the new traceback "
+                "and generated a targeted repair."
+            ),
+        )
+
+        report.steps.append(
+            repair_step
+        )
+
+        current_patch = (
+            normalized_next_patch
+        )
+
+        current_modified_source = (
+            next_modified_source
+        )
+
+    # =========================================================================
+    # FINAL SAFETY CHECK
+    # =========================================================================
+
+    successful_execution = any(
+        step.status == "passed"
+        and
+        step.name in (
+            "Regression Test",
+            "Repair Validation #2",
+            "Repair Validation #3",
+        )
+        for step in report.steps
+    )
+
+    if not successful_execution:
+
+        _rollback(
+            report=report,
+            backup_ref=first_backup_ref,
+            target_file=target_file,
+            repo_path=repo_path,
+        )
+
+        report.verdict = (
+            "VERIFICATION FAILED"
+        )
+
+        report.overall_success = False
+
+        return report
+
+    # =========================================================================
+    # VERIFIED
+    # =========================================================================
 
     report.steps.append(
         VerificationStep(
             name="Fix Verified",
             status="passed",
             message=(
-                "Frozen patch applied successfully, "
-                "repaired file runs successfully, "
-                "and no new existing-test regressions were detected."
+                "The repaired application executes successfully "
+                "and no new crash was detected."
             ),
         )
     )
@@ -477,14 +931,26 @@ async def verify_fix(
     )
 
     report.backup_ref = (
-        backup_ref
+        first_backup_ref
+    )
+
+    logger.info(
+        "============================================================"
+    )
+
+    logger.info(
+        "TRACEBACK FIX VERIFIED"
+    )
+
+    logger.info(
+        "============================================================"
     )
 
     return report
 
 
 # ============================================================================
-# HELPERS
+# PYTHON RESULT
 # ============================================================================
 
 def _python_to_test_result(
@@ -509,11 +975,12 @@ def _python_to_test_result(
             if crashed
             else 0
         ),
+        skipped=0,
         errors=(
             1
             if result.get(
                 "exit_code",
-                0,
+                -1,
             ) == -1
             else 0
         ),
@@ -543,9 +1010,15 @@ def _python_to_test_result(
             )
             or ""
         ),
-        success=not crashed,
+        success=(
+            not crashed
+        ),
     )
 
+
+# ============================================================================
+# PYTHON FAILURE
+# ============================================================================
 
 def _python_failure(
     result: dict,
@@ -571,14 +1044,14 @@ def _python_failure(
 
         return (
             "Repaired file still crashes:\n"
-            + stderr[:1500]
+            + stderr[:2000]
         )
 
     if stdout:
 
         return (
             "Repaired file exited unsuccessfully:\n"
-            + stdout[:1500]
+            + stdout[:2000]
         )
 
     return (
@@ -586,127 +1059,9 @@ def _python_failure(
     )
 
 
-def _failure_names(
-    result,
-) -> str:
-
-    names = (
-        _extract_test_failures(
-            result
-        )
-    )
-
-    if names:
-        return ", ".join(
-            sorted(names)
-        )
-
-    return "existing tests"
-
-
-def _extract_test_failures(
-    result,
-) -> set[str]:
-
-    if result is None:
-        return set()
-
-    text = (
-        str(
-            getattr(
-                result,
-                "stdout",
-                "",
-            )
-            or ""
-        )
-        + "\n"
-        +
-        str(
-            getattr(
-                result,
-                "stderr",
-                "",
-            )
-            or ""
-        )
-    )
-
-    import re
-
-    failures: set[str] = set()
-
-    for match in re.finditer(
-        r"(?m)^\s*(?:FAILED|ERROR)\s+(.+?)(?:\s+-|$)",
-        text,
-    ):
-
-        value = match.group(
-            1
-        ).strip()
-
-        if value:
-            failures.add(
-                value
-            )
-
-    return failures
-
-
-def _best_test_error(
-    result,
-) -> str:
-
-    stderr = str(
-        getattr(
-            result,
-            "stderr",
-            "",
-        )
-        or ""
-    ).strip()
-
-    stdout = str(
-        getattr(
-            result,
-            "stdout",
-            "",
-        )
-        or ""
-    ).strip()
-
-    if stderr:
-        return stderr[:1500]
-
-    if stdout:
-        return stdout[:1500]
-
-    failed = getattr(
-        result,
-        "failed",
-        0,
-    )
-
-    errors = getattr(
-        result,
-        "errors",
-        0,
-    )
-
-    if failed:
-        return (
-            f"{failed} test(s) failed."
-        )
-
-    if errors:
-        return (
-            f"{errors} test error(s) occurred."
-        )
-
-    return (
-        "Existing test suite failed."
-    )
-
+# ============================================================================
+# ROLLBACK
+# ============================================================================
 
 def _rollback(
     report: VerificationReport,
@@ -726,46 +1081,63 @@ def _rollback(
 
     started = time.time()
 
-    rollback_result = (
-        patch_service.rollback(
-            backup_ref=backup_ref,
-            target_file=target_file,
-            repo_path=repo_path,
-        )
-    )
+    try:
 
-    rollback_step.duration_ms = int(
-        (time.time() - started)
-        * 1000
-    )
-
-    if rollback_result.success:
-
-        rollback_step.status = (
-            "passed"
+        rollback_result = (
+            patch_service.rollback(
+                backup_ref=backup_ref,
+                target_file=target_file,
+                repo_path=repo_path,
+            )
         )
 
-        rollback_step.message = (
-            "Original source restored."
+        rollback_step.duration_ms = int(
+            (time.time() - started)
+            * 1000
         )
 
-    else:
+        if rollback_result.success:
+
+            rollback_step.status = (
+                "passed"
+            )
+
+            rollback_step.message = (
+                "Original source restored."
+            )
+
+        else:
+
+            rollback_step.status = (
+                "failed"
+            )
+
+            rollback_step.message = (
+                "Rollback failed: "
+                + rollback_result.message
+            )
+
+    except Exception as exc:
+
+        rollback_step.duration_ms = int(
+            (time.time() - started)
+            * 1000
+        )
 
         rollback_step.status = (
             "failed"
         )
 
         rollback_step.message = (
-            "Rollback failed: "
-            + rollback_result.message
+            f"Rollback error: {exc}"
+        )
+
+        logger.exception(
+            "Rollback failed."
         )
 
     report.overall_success = False
 
     report.verdict = (
         "VERIFICATION FAILED"
-    )
-
-    report.backup_ref = (
-        backup_ref
     )

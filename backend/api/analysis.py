@@ -1,4 +1,12 @@
-"""TraceBack AI investigation pipeline."""
+"""
+TraceBack Analysis API.
+
+Responsibilities:
+- Run the crash-analysis pipeline.
+- Capture the exact source used during analysis.
+- Store original and modified source.
+- Store hashes so stale investigations cannot silently modify files.
+"""
 
 from __future__ import annotations
 
@@ -36,7 +44,8 @@ from backend.services.ollama_service import (
 )
 
 from backend.services.patch_service import (
-    preview_patch,
+    apply_unified_diff,
+    normalize_patch,
 )
 
 from backend.services.source_analyzer import (
@@ -60,11 +69,18 @@ router = APIRouter(
 )
 
 
-# In-memory investigation store for hackathon.
+# ============================================================================
+# IN-MEMORY INVESTIGATION STORE
+# ============================================================================
+
 _investigations: list[
     Investigation
 ] = []
 
+
+# ============================================================================
+# REQUEST MODELS
+# ============================================================================
 
 class AnalyzeRequest(BaseModel):
 
@@ -97,25 +113,46 @@ class DemoRequest(BaseModel):
 def normalize_repo_path(
     repo_path: Optional[str],
 ) -> str:
+    """Return supplied repository path or configured default."""
 
     value = (
         repo_path or ""
     ).strip()
 
-    return (
-        value
-        if value
-        else DEFAULT_REPO_PATH
+    if value:
+        return value
+
+    return str(
+        DEFAULT_REPO_PATH
     )
 
 
-def source_hash(
-    text: str,
+def source_sha256(
+    source: str,
 ) -> str:
+    """Calculate SHA-256 of source text."""
 
     return hashlib.sha256(
-        text.encode("utf-8")
+        source.encode(
+            "utf-8"
+        )
     ).hexdigest()
+
+
+def find_investigation(
+    investigation_id: str,
+) -> Optional[Investigation]:
+    """Find investigation in memory."""
+
+    for investigation in _investigations:
+
+        if (
+            investigation.id
+            == investigation_id
+        ):
+            return investigation
+
+    return None
 
 
 # ============================================================================
@@ -127,15 +164,17 @@ async def full_analysis(
     request: AnalyzeRequest,
 ):
     """
-    Analyze one crash and freeze the exact source state used for analysis.
+    Analyze a crash.
 
-    The resulting investigation stores:
+    The important state captured here is:
+
         original_code
-        modified_code
         original_sha256
+        patch
+        modified_code
         modified_sha256
 
-    Approval can therefore apply the exact code that was previewed.
+    That frozen state is later used by Approve & Verify.
     """
 
     started = time.time()
@@ -153,26 +192,28 @@ async def full_analysis(
     )
 
     # ========================================================================
-    # 1. TRACEBACK
+    # 1. GET RAW TRACEBACK
     # ========================================================================
 
-    raw_tb = ""
+    raw_traceback = ""
 
     if (
         request.crash_result
-        and request.crash_result.raw_traceback
+        and
+        request.crash_result.raw_traceback
     ):
 
-        raw_tb = (
+        raw_traceback = (
             request.crash_result.raw_traceback
         )
 
     elif (
         request.traceback_text
-        and request.traceback_text.strip()
+        and
+        request.traceback_text.strip()
     ):
 
-        raw_tb = (
+        raw_traceback = (
             request.traceback_text
         )
 
@@ -180,24 +221,45 @@ async def full_analysis(
 
         raise HTTPException(
             status_code=400,
-            detail="No traceback provided.",
+            detail=(
+                "No traceback was supplied."
+            ),
         )
 
     if not is_traceback(
-        raw_tb
+        raw_traceback
     ):
 
         raise HTTPException(
             status_code=400,
             detail=(
                 "Input does not contain "
-                "a Python traceback."
+                "a valid Python traceback."
             ),
         )
 
-    parsed = parse_traceback(
-        raw_tb
-    )
+    # ========================================================================
+    # 2. PARSE TRACEBACK
+    # ========================================================================
+
+    try:
+
+        parsed = parse_traceback(
+            raw_traceback
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Traceback parsing failed"
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Could not parse traceback: {exc}"
+            ),
+        ) from exc
 
     investigation.error_type = (
         parsed.error_type
@@ -220,11 +282,11 @@ async def full_analysis(
     )
 
     investigation.raw_traceback = (
-        raw_tb
+        raw_traceback
     )
 
     # ========================================================================
-    # 2. SOURCE CONTEXT
+    # 3. SOURCE CONTEXT
     # ========================================================================
 
     try:
@@ -250,13 +312,13 @@ async def full_analysis(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Could not locate source file: "
-                f"{exc}"
+                f"Could not locate source for "
+                f"{parsed.file}: {exc}"
             ),
         ) from exc
 
     # ========================================================================
-    # 3. FULL ORIGINAL SOURCE SNAPSHOT
+    # 4. CAPTURE COMPLETE ORIGINAL SOURCE
     # ========================================================================
 
     try:
@@ -266,8 +328,6 @@ async def full_analysis(
             or parsed.file
         )
 
-        # Capture the ENTIRE source file,
-        # not only the context snippet.
         original_code = (
             read_file_safe(
                 actual_file,
@@ -275,12 +335,17 @@ async def full_analysis(
             )
         )
 
+        if not original_code:
+            raise ValueError(
+                "Source file is empty or could not be read."
+            )
+
         investigation.original_code = (
             original_code
         )
 
         investigation.original_sha256 = (
-            source_hash(
+            source_sha256(
                 original_code
             )
         )
@@ -288,29 +353,30 @@ async def full_analysis(
     except Exception as exc:
 
         logger.exception(
-            "Could not capture original source"
+            "Original source capture failed"
         )
 
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Could not read source file: "
-                f"{exc}"
+                f"Could not capture source: {exc}"
             ),
         ) from exc
 
     # ========================================================================
-    # 4. GIT
+    # 5. GIT INTELLIGENCE
     # ========================================================================
 
-    blame_string = ""
+    blame_text = ""
 
     try:
 
         if (
             parsed.file
-            and parsed.line
-            and git_service.is_git_repo(
+            and
+            parsed.line
+            and
+            git_service.is_git_repo(
                 repo_path
             )
         ):
@@ -329,51 +395,53 @@ async def full_analysis(
 
             if blame and blame.author:
 
-                blame_string = (
-                    f"Author: {blame.author}, "
-                    f"Commit: {blame.commit_hash}, "
+                blame_text = (
+                    f"Author: {blame.author}\n"
+                    f"Commit: {blame.commit_hash}\n"
                     f"Message: {blame.commit_message}"
                 )
 
     except Exception as exc:
 
         logger.warning(
-            "Git information unavailable: %s",
+            "Git intelligence unavailable: %s",
             exc,
         )
 
     # ========================================================================
-    # 5. AI
+    # 6. AI ANALYSIS
     # ========================================================================
 
     try:
 
         ai_result = (
             await ollama_service.analyze_crash(
-                error_type=parsed.error_type,
-                error_message=parsed.message,
-
-                # Give AI the entire file so it can produce a correct patch.
+                error_type=(
+                    parsed.error_type
+                ),
+                error_message=(
+                    parsed.message
+                ),
                 source_code=(
                     investigation.original_code
                 ),
-
                 file_path=(
                     parsed.file
                 ),
-
                 line_number=(
                     parsed.line
                 ),
-
                 function_name=(
                     source_context.function_name
-                    or parsed.function
+                    or
+                    parsed.function
                 ),
-
-                git_blame=blame_string,
-
-                traceback_raw=raw_tb,
+                git_blame=(
+                    blame_text
+                ),
+                traceback_raw=(
+                    raw_traceback
+                ),
             )
         )
 
@@ -422,7 +490,7 @@ async def full_analysis(
     except Exception as exc:
 
         logger.exception(
-            "AI analysis failed"
+            "AI crash analysis failed"
         )
 
         investigation.status = (
@@ -430,73 +498,81 @@ async def full_analysis(
         )
 
         investigation.root_cause = (
-            f"AI analysis unavailable: {exc}"
+            f"AI analysis failed: {exc}"
         )
 
         investigation.confidence = 0
 
     # ========================================================================
-    # 6. FREEZE MODIFIED SOURCE PREVIEW
+    # 7. CREATE EXACT MODIFIED SOURCE
     # ========================================================================
 
-    if (
-        investigation.patch
-    ):
+    if investigation.patch:
 
         try:
 
-            modified_code = (
-                _preview_against_snapshot(
-                    original_code=(
-                        investigation.original_code
-                    ),
-                    patch=(
-                        investigation.patch
-                    ),
-                    file_path=(
-                        parsed.file
-                    ),
+            normalized_patch = (
+                normalize_patch(
+                    patch=investigation.patch,
                     repo_path=repo_path,
+                    target_file=parsed.file,
                 )
             )
+
+            modified_code = (
+                apply_unified_diff(
+                    original=(
+                        investigation.original_code
+                    ),
+                    patch=normalized_patch,
+                )
+            )
+
+            if modified_code is None:
+                raise ValueError(
+                    "Generated patch does not match "
+                    "the captured original source."
+                )
+
+            if (
+                modified_code
+                ==
+                investigation.original_code
+            ):
+                raise ValueError(
+                    "Generated patch produces no change."
+                )
 
             investigation.modified_code = (
                 modified_code
             )
 
             investigation.modified_sha256 = (
-                source_hash(
+                source_sha256(
                     modified_code
                 )
             )
 
             investigation.preview_available = (
-                modified_code
-                != investigation.original_code
+                True
             )
-
-            if not investigation.preview_available:
-
-                investigation.preview_error = (
-                    "Generated patch produces "
-                    "no actual source change."
-                )
 
         except Exception as exc:
 
             logger.warning(
-                "Patch preview failed: %s",
+                "Could not create modified-source preview: %s",
                 exc,
             )
 
             investigation.modified_code = ""
+            investigation.modified_sha256 = ""
 
             investigation.preview_available = (
                 False
             )
 
             investigation.preview_error = (
-                f"Could not create patch preview: {exc}"
+                str(exc)
             )
 
     else:
@@ -506,11 +582,11 @@ async def full_analysis(
         )
 
         investigation.preview_error = (
-            "No patch was generated."
+            "AI did not produce a patch."
         )
 
     # ========================================================================
-    # 7. FINALIZE
+    # 8. FINALIZE
     # ========================================================================
 
     investigation.duration_ms = int(
@@ -525,62 +601,28 @@ async def full_analysis(
     return investigation.model_dump()
 
 
-def _preview_against_snapshot(
-    original_code: str,
-    patch: str,
-    file_path: str,
-    repo_path: str,
-) -> str:
-    """
-    Preview patch against the captured source snapshot.
-
-    We temporarily use the repository source only to reuse the normalized
-    patch path. The actual transformation is performed against the snapshot.
-    """
-
-    from backend.services.patch_service import (
-        apply_unified_diff,
-        normalize_patch,
-    )
-
-    normalized_patch = normalize_patch(
-        patch=patch,
-        repo_path=repo_path,
-        target_file=file_path,
-    )
-
-    modified = apply_unified_diff(
-        original=original_code,
-        patch=normalized_patch,
-    )
-
-    if modified is None:
-        raise ValueError(
-            "Patch does not match the source captured during analysis."
-        )
-
-    return modified
-
-
 # ============================================================================
-# DEMO
+# DEMO RUNNER
 # ============================================================================
 
 @router.post("/demo/run")
 async def run_demo(
     request: DemoRequest,
 ):
+    """Run bundled demo crash."""
 
     repo_path = (
         request.repo_path
-        or str(DEMO_PROJECT_DIR)
+        or
+        str(DEMO_PROJECT_DIR)
     )
 
-    repo = Path(
-        repo_path
-    ).resolve()
+    repo = (
+        Path(repo_path)
+        .resolve()
+    )
 
-    auth_file = (
+    target = (
         repo / "auth.py"
     )
 
@@ -589,18 +631,16 @@ async def run_demo(
         raise HTTPException(
             status_code=404,
             detail=(
-                f"Demo repository not found: "
-                f"{repo}"
+                f"Demo repository not found: {repo}"
             ),
         )
 
-    if not auth_file.is_file():
+    if not target.is_file():
 
         raise HTTPException(
             status_code=404,
             detail=(
-                f"Demo file not found: "
-                f"{auth_file}"
+                f"Demo file not found: {target}"
             ),
         )
 
@@ -611,7 +651,7 @@ async def run_demo(
         process = subprocess.run(
             [
                 sys.executable,
-                str(auth_file),
+                str(target),
             ],
             cwd=str(repo),
             capture_output=True,
@@ -619,25 +659,23 @@ async def run_demo(
             timeout=30,
         )
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
 
         raise HTTPException(
             status_code=500,
             detail=(
                 "Demo execution timed out."
             ),
-        )
-
-    duration_ms = int(
-        (time.time() - started)
-        * 1000
-    )
+        ) from exc
 
     result = CrashRunResult(
         stdout=process.stdout,
         stderr=process.stderr,
         exit_code=process.returncode,
-        duration_ms=duration_ms,
+        duration_ms=int(
+            (time.time() - started)
+            * 1000
+        ),
         crashed=(
             process.returncode != 0
         ),
@@ -650,7 +688,8 @@ async def run_demo(
 
     if (
         process.returncode != 0
-        and process.stderr
+        and
+        process.stderr
     ):
 
         try:
@@ -672,20 +711,24 @@ async def run_demo(
 
 
 # ============================================================================
-# INVESTIGATIONS
+# INVESTIGATION LIST
 # ============================================================================
 
 @router.get("/investigations")
 async def list_investigations():
 
     return [
-        investigation.model_dump()
-        for investigation
+        item.model_dump()
+        for item
         in reversed(
             _investigations
         )
     ]
 
+
+# ============================================================================
+# INVESTIGATION DETAIL
+# ============================================================================
 
 @router.get(
     "/investigations/{investigation_id}"
@@ -694,18 +737,21 @@ async def get_investigation(
     investigation_id: str,
 ):
 
-    for investigation in _investigations:
+    investigation = (
+        find_investigation(
+            investigation_id
+        )
+    )
 
-        if (
-            investigation.id
-            == investigation_id
-        ):
+    if investigation is None:
 
-            return (
-                investigation.model_dump()
-            )
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Investigation not found."
+            ),
+        )
 
-    raise HTTPException(
-        status_code=404,
-        detail="Investigation not found.",
+    return (
+        investigation.model_dump()
     )
