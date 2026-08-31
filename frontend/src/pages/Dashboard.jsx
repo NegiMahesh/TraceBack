@@ -1,13 +1,13 @@
 import React from 'react';
-import { 
-  ShieldAlert, 
-  Terminal, 
-  GitMerge, 
-  TestTube2, 
-  CheckCircle2, 
-  XCircle, 
-  ArrowRight, 
-  Flame, 
+import {
+  ShieldAlert,
+  Terminal,
+  GitMerge,
+  TestTube2,
+  CheckCircle2,
+  XCircle,
+  ArrowRight,
+  Flame,
   Sparkles,
   Layers,
   FileCode2,
@@ -15,7 +15,9 @@ import {
   Activity,
   Cpu,
   ShieldCheck,
-  Bug
+  Bug,
+  Info,
+  Bot
 } from 'lucide-react';
 import SeverityBadge from '../components/SeverityBadge';
 import ActivityStream from '../components/ActivityStream';
@@ -232,6 +234,56 @@ export default function Dashboard({
         {/* Right 1 Col: Live Engine Stream */}
         <div className="lg:col-span-1">
           <ActivityStream />
+        </div>
+      </div>
+      {/* Technology & Development */}
+      <div className="rounded-xl bg-slate-900/80 border border-white/10 p-5 shadow-xl space-y-4">
+        <div className="flex items-center gap-2 border-b border-white/10 pb-3">
+          <Info className="w-4 h-4 text-blue-400" />
+          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-200">
+            Technology &amp; Development
+          </h3>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+          <div className="p-3 rounded-lg bg-slate-950/60 border border-white/5 space-y-1">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 block">Project</span>
+            <span className="text-xs font-bold text-white">TraceBack AI</span>
+            <p className="text-[11px] text-slate-400 leading-snug">AI-powered autonomous crash resolution</p>
+          </div>
+
+          <div className="p-3 rounded-lg bg-slate-950/60 border border-white/5 space-y-1">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 block">Backend</span>
+            <span className="text-xs font-bold text-white font-mono">Python / FastAPI</span>
+            <p className="text-[11px] text-slate-400 leading-snug">REST API &amp; service layer</p>
+          </div>
+
+          <div className="p-3 rounded-lg bg-slate-950/60 border border-white/5 space-y-1">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 block">AI Engine</span>
+            <span className="text-xs font-bold text-white font-mono">Ollama</span>
+            <p className="text-[11px] text-slate-400 leading-snug">qwen2.5-coder:3b local inference</p>
+          </div>
+
+          <div className="p-3 rounded-lg bg-slate-950/60 border border-white/5 space-y-1">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 block">Testing</span>
+            <span className="text-xs font-bold text-white font-mono">pytest</span>
+            <p className="text-[11px] text-slate-400 leading-snug">Automated regression &amp; generated tests</p>
+          </div>
+
+          <div className="p-3 rounded-lg bg-slate-950/60 border border-white/5 space-y-1">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 block">Version Control</span>
+            <span className="text-xs font-bold text-white font-mono">Git</span>
+            <p className="text-[11px] text-slate-400 leading-snug">Blame analysis &amp; patch tracking</p>
+          </div>
+
+          <div className="p-3 rounded-lg bg-slate-950/60 border border-blue-500/20 space-y-1">
+            <div className="flex items-center gap-1.5">
+              <Bot className="w-3 h-3 text-blue-400" />
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-blue-400 block">AI-Assisted Dev</span>
+            </div>
+            <span className="text-xs font-bold text-blue-300">IBM Bob</span>
+            <p className="text-[11px] text-slate-400 leading-snug">AI development assistant</p>
+          </div>
         </div>
       </div>
     </div>

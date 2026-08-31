@@ -1,28 +1,21 @@
 def calculate_average(total_marks, number_of_subjects):
-    if number_of_subjects == 0:
-        return 0
     return total_marks / number_of_subjects
-
 
 def get_student(name, total_marks, number_of_subjects):
     average = calculate_average(
         total_marks,
         number_of_subjects
     )
-
     return {
         "name": name,
         "total_marks": total_marks,
         "average": average,
     }
 
-
 def get_result(student):
     if student["average"] >= 40:
         return "PASS"
-
     return "FAIL"
-
 
 def print_report(student):
     print("Student:", student["name"])
@@ -30,12 +23,10 @@ def print_report(student):
     print("Average:", student["average"])
     print("Result:", get_result(student))
 
-
 if __name__ == "__main__":
     student = get_student(
         "Mahesh",
         0,
         0
     )
-
     print_report(student)
